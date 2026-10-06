@@ -63,7 +63,7 @@ After that they ask their AI tool to "open <your distro>" and the chat window ap
 
 | Distro | What it adds |
 |---|---|
-| [Airaptr](https://github.com/airaptr/raptr) | Any OpenRouter model, scheduled jobs, built-in memory, a public demo mode |
+| Airaptr (private for now; [try the demo](https://airaptr.github.io/raptr/)) | Group chat with your AIs, take-over autopilot, a privacy gate, any OpenRouter model |
 
 Add yours with a pull request.
 
