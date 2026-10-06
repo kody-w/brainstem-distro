@@ -165,7 +165,7 @@ def app_html():
     inject = (f"<script>{bridge}</script>\n"
               f"<script type=\"module\">{client}\n"
               f"const app = new window.__McpApps.App({{name: {json.dumps(DISTRO['id'])}, version: {json.dumps(VERSION)}}}, {{}}, {{autoResize: false}});\n"
-              f"app.connect().then(() => window.__distroReady(app), e => window.__distroFailed(e));</script>\n")
+              f"app.connect().then(() => {{ app.sendSizeChanged({{height: {DISTRO.get('height', 680)}}}); window.__distroReady(app); }}, e => window.__distroFailed(e));</script>\n")
     head = re.search(r"<head[^>]*>", page, re.I)
     return page[:head.end()] + "\n" + inject + page[head.end():] if head else inject + page
 
