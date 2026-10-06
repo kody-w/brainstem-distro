@@ -188,7 +188,7 @@ def turns_after(n):
 VOICES = DISTRO.get("voices", {})
 MENTION = re.compile(r"@(\w+)")
 ROUNDS = int(DISTRO.get("max_rounds", 6))
-_auto = {"goal": None}
+_auto = {"goal": None, "driver_waiting": False}
 
 
 def voices_available():
@@ -228,14 +228,15 @@ def run_voice(name):
         return None, "took too long"
 
 
-def notify(text):
-    """Reach the person outside the chat: a desktop notification (macOS), plus a turn in the conversation."""
-    if sys.platform == "darwin" and not os.environ.get("DISTRO_QUIET"):
+def notify(text, final=True):
+    """A note in the conversation. Final notes (done, or a decision only the person can make) also reach the
+    person's desktop, unless an AI driving the distro is waiting for them instead."""
+    if final and sys.platform == "darwin" and not os.environ.get("DISTRO_QUIET") and not _auto["driver_waiting"]:  # an AI driving it gets the note instead
         subprocess.run(["osascript", "-e", f"display notification {json.dumps(text[:200])} with title {json.dumps(DISTRO['display_name'])}"],
                        capture_output=True)
     with _locked():
         t = load_thread()
-        t["turns"].append({"n": t["next"], "who": "notice", "text": text, "reply": ""})
+        t["turns"].append({"n": t["next"], "who": "notice", "text": text, "reply": "", "final": final})
         t["next"] += 1
         save_thread(t)
 
@@ -266,7 +267,8 @@ def follow_mentions(text, speaker):
             joined[name] = joined.get(name, 0) + 1
             said, err = run_voice(name)
             if err:
-                notify(f"{name} could not join: {err}")
+                joined[name] = 99  # do not try it again for this message
+                notify(f"{name} could not join: {err}", final=False)
                 continue
             status, body = say(name, said)
             text = said + "\n" + (json.loads(body).get("response", "") if status == 200 else "")
@@ -278,7 +280,7 @@ def follow_mentions(text, speaker):
 
 def after_turn(text, reply, speaker):
     m = re.match(r"\s*(take over|autopilot)[:,]?\s*(.*)", text, re.I | re.S)
-    if m and speaker == "window":
+    if m and speaker not in VOICES:
         _auto["goal"] = m.group(2).strip() or "whatever the conversation is working on right now"
     elif speaker == "window" and re.match(r"\s*(stop|pause)\b", text, re.I):
         _auto["goal"] = None
@@ -286,6 +288,38 @@ def after_turn(text, reply, speaker):
     elif speaker == "window" and re.match(r"\s*keep going\b", text, re.I) and not _auto["goal"]:
         _auto["goal"] = "continue the last goal"
     threading.Thread(target=follow_mentions, args=(text + "\n" + reply, speaker), daemon=True).start()
+
+
+def take_over(goal, wait=True, timeout=1800):
+    """Start autopilot on a goal; with wait, block until it finishes and return its final note."""
+    goal = (goal or "").strip()
+    if not goal:
+        return {"content": [{"type": "text", "text": "goal is required"}], "isError": True}
+    start_n = (turns_after(0) or [{"n": 0}])[-1]["n"]
+    status, body = say(_host["name"], f"Take over: {goal}")
+    if status != 200:
+        return {"content": [{"type": "text", "text": f"The engine answered {status}: {body[:300]}"}], "isError": True}
+    _auto["goal"] = goal
+    threading.Thread(target=follow_mentions, args=(f"Take over: {goal}\n" + json.loads(body).get("response", ""), _host["name"]), daemon=True).start()
+    if not wait:
+        return {"content": [{"type": "text", "text": f"{DISTRO['display_name']} is on it."}]}
+    _auto["driver_waiting"] = True
+    try:
+        return _wait_for_result(start_n, timeout)
+    finally:
+        _auto["driver_waiting"] = False
+
+
+def _wait_for_result(start_n, timeout):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        done = [x for x in turns_after(start_n) if x["who"] == "notice" and x.get("final", True)]
+        if done:
+            log_lines = [f"- {'user' if x['who'] == 'window' else x['who']}: {x['text'][:300]}" for x in turns_after(start_n) if x["who"] not in ("notice", "Autopilot")]
+            return {"content": [{"type": "text", "text": done[-1]["text"] + "\n\nWhat happened:\n" + "\n".join(log_lines[-12:])}],
+                    "structuredContent": {"result": done[-1]["text"], "needs_user": done[-1]["text"].startswith("NEED_USER")}}
+        time.sleep(2)
+    return {"content": [{"type": "text", "text": "Still working; read the conversation later."}]}
 
 
 # ---------- agents, for engines that keep only /chat and /health
@@ -398,6 +432,12 @@ def tools():
                          f"The user talks to {name} in its window; you talk to it here; everyone sees the whole conversation. "
                          f"The answer also includes anything the user said in the window since you last spoke."),
          "inputSchema": {"type": "object", "required": ["message"], "properties": {"message": {"type": "string"}}}},
+        {"name": "take_over", "title": f"Hand {name} a goal",
+         "description": (f"Hand {name} a goal to finish on its own for the user. It works with the other AIs in the shared conversation "
+                         f"and stops when it is done or needs a decision. With wait=true (default) this returns that final note; "
+                         f"answer NEED_USER questions yourself when you can, by calling chat, and only involve the user when you must."),
+         "inputSchema": {"type": "object", "required": ["goal"], "properties": {
+             "goal": {"type": "string"}, "wait": {"type": "boolean", "description": "wait for the result (default true)"}}}},
         {"name": "conversation", "title": f"Read the conversation with {name}",
          "description": f"Read the latest turns of the shared conversation between the user, you and {name}.",
          "inputSchema": {"type": "object", "properties": {"last": {"type": "integer", "description": "how many turns (default 10)"}}},
@@ -447,6 +487,8 @@ def call_tool(name, args):
                    f"\n\n{DISTRO['display_name']} now answers you:\n" + out)
         return {"content": [{"type": "text", "text": out}],
                 "structuredContent": {"response": d.get("response", ""), "since_you_spoke": [{"who": x["who"], "text": x["text"], "reply": x.get("reply", "")} for x in missed]}}
+    if name == "take_over":
+        return take_over(args.get("goal", ""), args.get("wait", True))
     if name == "conversation":
         turns = turns_after(0)[-int(args.get("last") or 10):]
         return {"content": [{"type": "text", "text": "\n".join(f"- {('user' if x['who'] == 'window' else x['who'])}: {x['text'][:400]}\n  {DISTRO['display_name']}: {x['reply'][:600]}" for x in turns) or "No conversation yet."}]}
@@ -546,7 +588,24 @@ def serve():
         _engine["proc"].terminate()
 
 
+def cli(argv):
+    """Drive the distro from a terminal or another agent, in the same shared conversation:
+    server.py --say "message" | --take-over "goal" | --conversation [n]"""
+    _host["name"] = os.environ.get("DISTRO_SPEAKER", "Claude")
+    _host["seen"] = (turns_after(0) or [{"n": 0}])[-1]["n"]
+    if argv[0] == "--say":
+        r = call_tool("chat", {"message": " ".join(argv[1:])})
+    elif argv[0] == "--take-over":
+        r = take_over(" ".join(argv[1:]))
+    else:
+        r = call_tool("conversation", {"last": int(argv[1]) if len(argv) > 1 else 10})
+    print(r["content"][0]["text"])
+    return 1 if r.get("isError") else 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in ("--say", "--take-over", "--conversation"):
+        sys.exit(cli(sys.argv[1:]))
     if "--check" in sys.argv:
         report = {"engine": engine(), "health": json.loads(call_engine("GET", "/health")[1]), "page_bytes": len(app_html().encode())}
         print(json.dumps(report, indent=2))
