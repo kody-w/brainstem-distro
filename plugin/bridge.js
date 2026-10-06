@@ -116,9 +116,10 @@
   var seen = -1;
   function draw(t, mine) {
     if (typeof appendMsg !== 'function') return;
+    if (t.who === 'notice') { appendMsg('system', t.text); return; }
     var said = mine ? t.text : t.who + ': ' + t.text;
     appendMsg('user', said);
-    appendMsg('assistant', t.reply, t.agent_logs && String(t.agent_logs).trim() ? t.agent_logs : null);
+    if (t.reply) appendMsg('assistant', t.reply, t.agent_logs && String(t.agent_logs).trim() ? t.agent_logs : null);
     try { history.push({ role: 'user', content: said }, { role: 'assistant', content: t.reply }); } catch (e) {}
   }
   async function poll() {

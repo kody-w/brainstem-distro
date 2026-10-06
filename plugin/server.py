@@ -21,6 +21,8 @@ UI_MIME = "text/html;profile=mcp-app"
 VERSION = DISTRO.get("version", "0.1.0")
 
 _engine = {"url": None, "proc": None}
+# AI tools start plugins with a short PATH; add the usual places CLIs live so the other AIs can be found.
+os.environ["PATH"] = os.pathsep.join([os.environ.get("PATH", ""), *map(os.path.expanduser, ["~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "~/.npm-global/bin"])])
 _lock = threading.Lock()
 
 
@@ -153,7 +155,15 @@ def say(who, text):
     with _locked():
         t = load_thread()
     history = []
+    avail = voices_available()
+    if avail:
+        history += [{"role": "user", "content": f"(Group chat) Besides the user, these AIs can join: {', '.join('@' + n for n in avail)}. "
+                                                "Mention one with @Name in your reply to bring them in; they see the whole conversation. "
+                                                "If the user says 'take over', keep the work moving with them and only ask the user when you must."},
+                    {"role": "assistant", "content": "Understood."}]
     for turn in t["turns"]:
+        if turn["who"] == "notice":
+            continue
         history.append({"role": "user", "content": turn["text"] if turn["who"] == "window" else f"[{turn['who']}] {turn['text']}"})
         history.append({"role": "assistant", "content": turn["reply"]})
     user_input = text if who == "window" else f"[{who}] {text}"
@@ -171,6 +181,111 @@ def say(who, text):
 def turns_after(n):
     with _locked():
         return [x for x in load_thread()["turns"] if x["n"] > n]
+
+
+# ---------- the other AIs: the distro brings them into the conversation itself, through the CLIs the user already
+# signed in to. They run with no tools, from an empty folder, and only see the conversation.
+VOICES = DISTRO.get("voices", {})
+MENTION = re.compile(r"@(\w+)")
+ROUNDS = int(DISTRO.get("max_rounds", 6))
+_auto = {"goal": None}
+
+
+def voices_available():
+    import shutil
+    return {n: v for n, v in VOICES.items() if shutil.which(v["command"][0])}
+
+
+def transcript(limit=30):
+    lines = []
+    for x in turns_after(0)[-limit:]:
+        lines.append(f"{'User' if x['who'] == 'window' else x['who']}: {x['text']}")
+        if x.get("reply"):
+            lines.append(f"{DISTRO['display_name']}: {x['reply']}")
+    return "\n".join(lines)
+
+
+def run_voice(name):
+    import tempfile
+    v = VOICES[name]
+    prompt = (f"You are {name}, in a group chat with the user, {DISTRO['display_name']} (the user's own AI) and other AIs. "
+              f"The conversation so far:\n\n{transcript()}\n\nReply to the latest message as {name}: briefly (under 120 words), "
+              "plain text, no preamble. To bring someone in, mention them with @Name.")
+    work = tempfile.mkdtemp()
+    out_file = os.path.join(work, "out.txt")
+    cmd = [c.replace("{out}", out_file) for c in v["command"]]
+    if not v.get("stdin"):
+        cmd = [c.replace("{prompt}", prompt) for c in cmd]
+    try:
+        r = subprocess.run(cmd, input=prompt if v.get("stdin") else None, capture_output=True, text=True, cwd=work,
+                           timeout=int(v.get("timeout", 240)), stdin=None if v.get("stdin") else subprocess.DEVNULL)
+        text = open(out_file).read() if "{out}" in " ".join(v["command"]) and os.path.exists(out_file) else r.stdout
+        text = text.strip()
+        if r.returncode != 0 or not text:
+            return None, (r.stderr or r.stdout or "no answer").strip().splitlines()[-1][:200]
+        return text, None
+    except subprocess.TimeoutExpired:
+        return None, "took too long"
+
+
+def notify(text):
+    """Reach the person outside the chat: a desktop notification (macOS), plus a turn in the conversation."""
+    if sys.platform == "darwin" and not os.environ.get("DISTRO_QUIET"):
+        subprocess.run(["osascript", "-e", f"display notification {json.dumps(text[:200])} with title {json.dumps(DISTRO['display_name'])}"],
+                       capture_output=True)
+    with _locked():
+        t = load_thread()
+        t["turns"].append({"n": t["next"], "who": "notice", "text": text, "reply": ""})
+        t["next"] += 1
+        save_thread(t)
+
+
+def follow_mentions(text, speaker):
+    """Bring in whoever was @mentioned, let the distro answer each, and keep going while they mention others
+    (or while autopilot runs), up to ROUNDS calls for one message."""
+    avail = voices_available()
+    joined = {}
+    for _ in range(ROUNDS):
+        names = {m.lower() for m in MENTION.findall(text)}
+        want = [n for n in avail if n.lower() in names or names & {"all", "everyone"}]
+        want = [n for n in want if n != speaker and joined.get(n, 0) < 2]  # nobody is pulled in more than twice per message
+        if _auto["goal"] and (not want or joined):  # on autopilot, check after every round whether it is done or needs the person
+            status, body = say("Autopilot", f"Goal: {_auto['goal']}. Decide the next step. Mention who should act with @Name, "
+                                            "or answer starting NEED_USER: <question> if only the user can decide, or DONE: <summary> if the goal is met.")
+            reply = json.loads(body).get("response", "") if status == 200 else ""
+            if reply.startswith("NEED_USER") or reply.startswith("DONE") or status != 200:
+                _auto["goal"] = None
+                notify(reply or "Autopilot stopped: the engine did not answer.")
+                return
+            if not want:
+                text, speaker = reply, DISTRO["display_name"]
+                continue
+        if not want:
+            return
+        for name in want:
+            joined[name] = joined.get(name, 0) + 1
+            said, err = run_voice(name)
+            if err:
+                notify(f"{name} could not join: {err}")
+                continue
+            status, body = say(name, said)
+            text = said + "\n" + (json.loads(body).get("response", "") if status == 200 else "")
+            speaker = name
+    if _auto["goal"]:
+        _auto["goal"] = None
+        notify(f"Autopilot paused after {ROUNDS} steps. Say 'keep going' to continue.")
+
+
+def after_turn(text, reply, speaker):
+    m = re.match(r"\s*(take over|autopilot)[:,]?\s*(.*)", text, re.I | re.S)
+    if m and speaker == "window":
+        _auto["goal"] = m.group(2).strip() or "whatever the conversation is working on right now"
+    elif speaker == "window" and re.match(r"\s*(stop|pause)\b", text, re.I):
+        _auto["goal"] = None
+        return
+    elif speaker == "window" and re.match(r"\s*keep going\b", text, re.I) and not _auto["goal"]:
+        _auto["goal"] = "continue the last goal"
+    threading.Thread(target=follow_mentions, args=(text + "\n" + reply, speaker), daemon=True).start()
 
 
 # ---------- agents, for engines that keep only /chat and /health
@@ -215,7 +330,10 @@ def http_tool(args):
             text = ""
         if not isinstance(text, str) or not text.strip():
             return 400, json.dumps({"error": "user_input is required"})
-        return say("window", text)
+        status, body = say("window", text)
+        if status == 200:
+            after_turn(text, json.loads(body).get("response", ""), "window")
+        return status, body
     if method == "GET" and path.startswith("/distro/thread"):
         m = re.search(r"after=(\d+)", path)
         return 200, json.dumps({"turns": turns_after(int(m.group(1)) if m else 0)})
@@ -310,8 +428,10 @@ def call_tool(name, args):
         message = args.get("message", "")
         if not message.strip():
             return {"content": [{"type": "text", "text": "message is required"}], "isError": True}
-        missed = [x for x in turns_after(_host["seen"]) if x["who"] == "window"]
+        missed = [x for x in turns_after(_host["seen"]) if x["who"] != _host["name"]]
         status, text = say(_host["name"], message)
+        if status == 200:
+            after_turn(message, json.loads(text).get("response", ""), _host["name"])
         try:
             d = json.loads(text)
         except ValueError:
@@ -322,11 +442,11 @@ def call_tool(name, args):
         _host["seen"] = latest[-1]["n"] if latest else 0
         out = d.get("response", "")
         if missed:
-            out = ("Since you last spoke, the user said in the window:\n" +
-                   "\n".join(f"- user: {x['text'][:400]}\n  {DISTRO['display_name']}: {x['reply'][:600]}" for x in missed) +
+            out = ("Since you last spoke, in the conversation:\n" +
+                   "\n".join(f"- {'user' if x['who'] == 'window' else x['who']}: {x['text'][:400]}" + (f"\n  {DISTRO['display_name']}: {x['reply'][:600]}" if x.get("reply") else "") for x in missed) +
                    f"\n\n{DISTRO['display_name']} now answers you:\n" + out)
         return {"content": [{"type": "text", "text": out}],
-                "structuredContent": {"response": d.get("response", ""), "user_in_window": [{"text": x["text"], "reply": x["reply"]} for x in missed]}}
+                "structuredContent": {"response": d.get("response", ""), "since_you_spoke": [{"who": x["who"], "text": x["text"], "reply": x.get("reply", "")} for x in missed]}}
     if name == "conversation":
         turns = turns_after(0)[-int(args.get("last") or 10):]
         return {"content": [{"type": "text", "text": "\n".join(f"- {('user' if x['who'] == 'window' else x['who'])}: {x['text'][:400]}\n  {DISTRO['display_name']}: {x['reply'][:600]}" for x in turns) or "No conversation yet."}]}

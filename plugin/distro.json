@@ -10,5 +10,45 @@
   "connect_domains": [
     "https://raw.githubusercontent.com"
   ],
-  "labels": []
+  "labels": [],
+  "voices": {
+    "Claude": {
+      "command": [
+        "claude",
+        "-p",
+        "--tools",
+        "",
+        "--strict-mcp-config",
+        "--no-session-persistence",
+        "--output-format",
+        "text"
+      ],
+      "stdin": true
+    },
+    "Codex": {
+      "command": [
+        "codex",
+        "exec",
+        "--sandbox",
+        "read-only",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "-o",
+        "{out}",
+        "-"
+      ],
+      "stdin": true
+    },
+    "Copilot": {
+      "command": [
+        "copilot",
+        "-p",
+        "{prompt}",
+        "-s",
+        "--available-tools",
+        ""
+      ]
+    }
+  },
+  "max_rounds": 6
 }
