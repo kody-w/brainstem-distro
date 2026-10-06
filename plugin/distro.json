@@ -24,7 +24,8 @@
         "text"
       ],
       "stdin": true,
-      "cost": "subscription"
+      "cost": "subscription",
+      "trusted": true
     },
     "Codex": {
       "command": [
@@ -39,7 +40,8 @@
         "-"
       ],
       "stdin": true,
-      "cost": "subscription"
+      "cost": "subscription",
+      "trusted": true
     },
     "Copilot": {
       "command": [
@@ -50,7 +52,8 @@
         "--available-tools",
         ""
       ],
-      "cost": "subscription"
+      "cost": "subscription",
+      "trusted": true
     }
   },
   "max_rounds": 6

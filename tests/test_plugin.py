@@ -32,7 +32,8 @@ srv = ThreadingHTTPServer(("127.0.0.1", 0), Engine)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 agents = tempfile.mkdtemp()
 cfg = json.load(open(os.path.join(ROOT, "distro.json")))
-cfg["voices"] = {"PaidBot": {"kind": "api", "model": "x/y", "cost": "paid"}}
+cfg["voices"] = {"PaidBot": {"kind": "api", "model": "x/y", "cost": "paid"},
+                 "Stranger": {"command": [sys.executable, "-c", "print('should never run')"], "cost": "free"}}
 os.environ["OPENROUTER_API_KEY"] = "test-not-a-real-key"
 cfg.update(labels=[["RAPP Brainstem", "Test Distro"]], engine={"url": f"http://127.0.0.1:{srv.server_port}"}, agents_dir=agents)
 work = tempfile.mkdtemp()
@@ -69,6 +70,7 @@ escape = tool("http", {"path": "/../etc/passwd"})["structuredContent"]
 chat = tool("chat", {"message": "hi"})
 win = lambda text: json.loads(tool("http", {"method": "POST", "path": "/chat", "body": json.dumps({"user_input": text})})["structuredContent"]["body"])["response"]
 v0 = tool("voices", {})["structuredContent"]["voices"]["PaidBot"]
+stranger = tool("voices", {})["structuredContent"]["voices"]["Stranger"]
 ai_allow = tool("chat", {"message": "allow @PaidBot"})
 v1 = tool("voices", {})["structuredContent"]["voices"]["PaidBot"]
 person_allow = win("allow @PaidBot")
@@ -79,6 +81,10 @@ good_agent = "from agents.basic_agent import BasicAgent\n\nclass ShoutAgent(Basi
 added = tool("add_agent", {"filename": "shout_agent.py", "code": good_agent})
 bad_add = tool("add_agent", {"filename": "Shout.py", "code": good_agent})
 p.stdin.close(); p.wait(timeout=10)
+spec = __import__("importlib.util").util.spec_from_file_location("srv", os.path.join(work, "server.py"))
+srv = __import__("importlib.util").util.module_from_spec(spec); os.environ["DISTRO_CACHE"] = tempfile.mkdtemp()
+_cwd = os.getcwd(); os.chdir(work); spec.loader.exec_module(srv); os.chdir(_cwd)
+untrusted_said, untrusted_err = srv.run_voice("Stranger")
 
 checks = {
     "initialize names the distro": init["serverInfo"]["name"] == cfg["id"],
@@ -96,6 +102,7 @@ checks = {
     "add_agent installs a new agent": not added.get("isError") and os.path.exists(os.path.join(agents, "shout_agent.py")),
     "add_agent refuses a bad filename": bad_add.get("isError") is True,
     "add_agent is visible to the model": "add_agent" in tools and "ui" not in tools["add_agent"].get("_meta", {}),
+    "an untrusted AI without the gate never gets the conversation": untrusted_said is None and "not sent" in (untrusted_err or "") and stranger["trusted"] is False,
     "paid AIs start out not allowed": v0["cost"] == "paid" and v0["allowed"] is False,
     "an AI cannot allow spending": v1["allowed"] is False,
     "the person can allow a paid AI by name": "Allowed" in person_allow and v2["allowed"] is True,

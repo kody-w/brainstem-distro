@@ -221,7 +221,7 @@ def usable(name, v):
 
 def flags(name, v):
     cost = v.get("cost", "paid" if v.get("kind") == "api" else "subscription")
-    return {"cost": cost, "allowed": usable(name, v), "privacy_gate": v.get("gate") == "redact",
+    return {"cost": cost, "allowed": usable(name, v), "privacy_gate": v.get("gate") == "redact", "trusted": bool(v.get("trusted")),
             "tools": "none", "how": "API " + v.get("model", "") if v.get("kind") == "api" else "its own app, signed in"}
 
 
@@ -345,6 +345,8 @@ def run_voice(name):
     import tempfile
     v = VOICES[name]
     convo, found, swapped = transcript(), {}, 0
+    if not v.get("trusted") and v.get("gate") != "redact":  # the conversation may be sensitive: untrusted AIs only get a gated copy
+        return None, "not sent: it isn't trusted with the conversation and has no privacy gate"
     if v.get("gate") == "redact":
         try:
             convo, found, swapped = gate(convo)
@@ -671,7 +673,7 @@ def call_tool(name, args):
         avail = voices_available()
         rows = {n: {**flags(n, v), "installed": n in avail} for n, v in VOICES.items()}
         return {"content": [{"type": "text", "text": "\n".join(f"- {n}: {f['cost']}, {'allowed' if f['allowed'] else 'not allowed (paid)'}"
-                                                          f"{', privacy gate' if f['privacy_gate'] else ''}, tools: none"
+                                                          f"{', trusted' if f['trusted'] else ''}{', privacy gate' if f['privacy_gate'] else ''}, tools: none"
                                                           f"{'' if f['installed'] else ', not set up on this machine'}" for n, f in rows.items()) or "No other AIs set up."}],
                 "structuredContent": {"voices": rows}}
     if name == "take_over":
