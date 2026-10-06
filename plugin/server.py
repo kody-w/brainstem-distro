@@ -10,7 +10,7 @@ front of the page reroutes the page's same-origin calls (/chat, /health, /agents
     python3 server.py           MCP over stdio (what the AI tool runs)
     python3 server.py --check   start the engine, fetch and verify the page, print a JSON report
 """
-import hashlib, json, os, re, socket, subprocess, sys, threading, time, urllib.error, urllib.request
+import hashlib, json, os, re, socket, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DISTRO = json.load(open(os.path.join(HERE, "distro.json")))
@@ -193,7 +193,7 @@ _auto = {"goal": None, "driver_waiting": False}
 
 def voices_available():
     import shutil
-    return {n: v for n, v in VOICES.items() if shutil.which(v["command"][0])}
+    return {n: v for n, v in VOICES.items() if (v.get("kind") == "api" and _api_key(v)) or (v.get("command") and shutil.which(v["command"][0]))}
 
 
 def transcript(limit=30):
@@ -205,12 +205,128 @@ def transcript(limit=30):
     return "\n".join(lines)
 
 
+# ---------- the privacy gate: for voices marked "gate": "redact", private details are swapped for placeholders
+# before anything leaves the machine, and swapped back in the reply. Fail closed: if the gate cannot run, the voice
+# is not called.
+GATE_PATTERNS = [
+    ("EMAIL", r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"),
+    ("KEY", r"\b(?:sk|pk|rk|ghp|gho|ghs|github_pat|xox[abpr]|AKIA|AIza)[-_A-Za-z0-9]{12,}"),
+    ("KEY", r"\b(?=[A-Za-z0-9+/_=-]*\d)(?=[A-Za-z0-9+/_=-]*[A-Za-z])[A-Za-z0-9+/_=-]{32,}"),
+    ("CARD", r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)"),
+    ("PHONE", r"(?<![\w+])\+?\d[\d ().-]{8,}\d(?!\w)"),
+    ("PATH", r"(?:/Users|/home|[A-Za-z]:\\Users)[/\\][^\s/\\]+"),
+    ("IP", r"\b\d{1,3}(?:\.\d{1,3}){3}\b"),
+]
+
+
+def _denylist():
+    path = DISTRO.get("denylist") or os.environ.get("DISTRO_DENYLIST")
+    if not path:
+        return []
+    terms = []
+    for line in open(os.path.expanduser(path), encoding="utf-8"):  # unreadable -> exception -> the voice is not called
+        line = line.strip()
+        if line and not line.startswith("#"):
+            terms.append(line[3:] if line.startswith("re:") else re.escape(line))
+    return terms
+
+
+def local_screen(text):
+    """Optional first hop, off unless distro.json has "screen": {"url": <a local OpenAI-compatible endpoint>, "model": ...}.
+    A model on this machine reads the real text and names anything sensitive the patterns would miss (names, places,
+    health or money details). Nothing leaves the machine here; an unreachable screen fails closed."""
+    sc = DISTRO.get("screen") or {}
+    if not sc.get("url"):
+        return []
+    host = urllib.parse.urlparse(sc["url"]).hostname
+    if host not in ("localhost", "127.0.0.1", "::1"):
+        raise RuntimeError("the screen must run on this machine")
+    ask = ("List every piece of personal or sensitive information in the text: people's names, organization names, addresses, "
+           "account or ID numbers, health or money details, anything private. Copy each one exactly as written. "
+           'Answer with JSON only: {"items": ["...", "..."]}.\n\nText:\n' + text)
+    body = json.dumps({"model": sc.get("model", ""), "temperature": 0, "messages": [{"role": "user", "content": ask}]}).encode()
+    req = urllib.request.Request(sc["url"].rstrip("/") + "/chat/completions", data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=int(sc.get("timeout", 120))) as r:
+        answer = json.load(r)["choices"][0]["message"]["content"]
+    items = json.loads(answer[answer.find("{"):answer.rfind("}") + 1]).get("items", [])
+    return sorted({i for i in items if isinstance(i, str) and len(i) > 1 and i in text}, key=len, reverse=True)
+
+
+def gate(text):
+    """Returns (safe text, placeholder -> original, how many swapped)."""
+    found, n = {}, {}
+    screened = local_screen(text)
+
+    def swap(kind):
+        def repl(m):
+            original = m.group(0)
+            for ph, val in found.items():
+                if val == original:
+                    return ph
+            n[kind] = n.get(kind, 0) + 1
+            ph = f"[{kind}_{n[kind]}]"
+            found[ph] = original
+            return ph
+        return repl
+    for term in [re.escape(i) for i in screened] + _denylist():
+        text = re.sub(term, swap("PRIVATE"), text, flags=re.I)
+    for kind, pattern in GATE_PATTERNS:
+        text = re.sub(pattern, swap(kind), text)
+    for term in _denylist():  # belt and braces: nothing on the list may remain
+        if re.search(term, text, re.I):
+            raise RuntimeError("the privacy gate could not clear the conversation")
+    return text, found, sum(n.values())
+
+
+def ungate(text, found):
+    for ph, val in found.items():
+        text = text.replace(ph, val)
+    return text
+
+
+def _api_key(v):
+    if os.environ.get(v.get("key_env", "OPENROUTER_API_KEY")):
+        return os.environ[v.get("key_env", "OPENROUTER_API_KEY")]
+    src = v.get("key_from") or {}
+    if src.get("file"):
+        return json.load(open(os.path.expanduser(src["file"]))).get(src.get("field", "key"), "")
+    return ""
+
+
 def run_voice(name):
     import tempfile
     v = VOICES[name]
+    convo, found, swapped = transcript(), {}, 0
+    if v.get("gate") == "redact":
+        try:
+            convo, found, swapped = gate(convo)
+        except Exception as e:
+            return None, f"not sent: the privacy gate failed closed ({e})"
+        kinds = {}
+        for ph in found:
+            k = ph[1:].rsplit("_", 1)[0]
+            kinds[k] = kinds.get(k, 0) + 1
+        os.makedirs(CACHE, exist_ok=True)  # a local record of what left: counts and a fingerprint, never the private values
+        with open(os.path.join(CACHE, "gate-log.jsonl"), "a") as f:
+            f.write(json.dumps({"at": int(time.time()), "voice": name, "swapped": kinds,
+                                "sent_sha256": hashlib.sha256(convo.encode()).hexdigest(), "screen": bool((DISTRO.get("screen") or {}).get("url"))}) + "\n")
     prompt = (f"You are {name}, in a group chat with the user, {DISTRO['display_name']} (the user's own AI) and other AIs. "
-              f"The conversation so far:\n\n{transcript()}\n\nReply to the latest message as {name}: briefly (under 120 words), "
+              + ("Some private details were replaced with placeholders like [EMAIL_1]; use the placeholders as they are. " if swapped else "")
+              + f"The conversation so far:\n\n{convo}\n\nReply to the latest message as {name}: briefly (under 120 words), "
               "plain text, no preamble. To bring someone in, mention them with @Name.")
+    if v.get("kind") == "api":
+        key = _api_key(v)
+        if not key:
+            return None, "no API key"
+        body = json.dumps({"model": v["model"], "messages": [{"role": "user", "content": prompt}], "max_tokens": 600}).encode()
+        req = urllib.request.Request(v.get("base_url", "https://openrouter.ai/api/v1").rstrip("/") + "/chat/completions", data=body,
+                                     headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
+        try:
+            with urllib.request.urlopen(req, timeout=int(v.get("timeout", 120))) as r:
+                text = (json.load(r)["choices"][0]["message"]["content"] or "").strip()
+        except Exception as e:
+            return None, str(e)[:200]
+        return (ungate(text, found), None) if text else (None, "no answer")
     work = tempfile.mkdtemp()
     out_file = os.path.join(work, "out.txt")
     cmd = [c.replace("{out}", out_file) for c in v["command"]]
@@ -223,7 +339,7 @@ def run_voice(name):
         text = text.strip()
         if r.returncode != 0 or not text:
             return None, (r.stderr or r.stdout or "no answer").strip().splitlines()[-1][:200]
-        return text, None
+        return ungate(text, found), None
     except subprocess.TimeoutExpired:
         return None, "took too long"
 
@@ -599,7 +715,13 @@ def cli(argv):
         r = take_over(" ".join(argv[1:]))
     else:
         r = call_tool("conversation", {"last": int(argv[1]) if len(argv) > 1 else 10})
+    for t in threading.enumerate():  # let the AIs it brought in finish before this process exits
+        if t is not threading.current_thread() and t.daemon:
+            t.join(timeout=900)
     print(r["content"][0]["text"])
+    late = [x for x in turns_after(_host["seen"]) if x["who"] not in (_host["name"],)]
+    if late and argv[0] == "--say":
+        print("\nThen:\n" + "\n".join(f"- {x['who']}: {x['text'][:400]}" + (f"\n  {DISTRO['display_name']}: {x['reply'][:400]}" if x.get("reply") else "") for x in late))
     return 1 if r.get("isError") else 0
 
 
