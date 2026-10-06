@@ -69,11 +69,12 @@ def engine():
         if not eng.get("command"):
             raise RuntimeError(f"No engine answering at {url}. {eng.get('install_hint', '')}".strip())
         port = _free_port()
-        cmd = [sys.executable if c == "{python}" else c.replace("{port}", str(port)).replace("{root}", HERE) for c in eng["command"]]
-        env = {**os.environ, **{k: v.replace("{port}", str(port)) for k, v in eng.get("env", {}).items()}}
+        cmd = [sys.executable if c == "{python}" else os.path.expanduser(c.replace("{port}", str(port)).replace("{root}", HERE)) for c in eng["command"]]
+        env = {**os.environ, **{k: os.path.expanduser(v.replace("{port}", str(port))) for k, v in eng.get("env", {}).items()}}
+        cwd = os.path.expanduser(eng["cwd"]) if eng.get("cwd") else HERE
         os.makedirs(CACHE, exist_ok=True)
         out = open(os.path.join(CACHE, "engine.log"), "ab")
-        proc = subprocess.Popen(cmd, cwd=HERE, env=env, stdout=out, stderr=out, stdin=subprocess.DEVNULL)
+        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out, stderr=out, stdin=subprocess.DEVNULL)
         url = f"http://127.0.0.1:{port}"
         for _ in range(100):
             if proc.poll() is not None:
@@ -381,7 +382,7 @@ def run_voice(name):
         return (ungate(text, found), None) if text else (None, "no answer")
     work = tempfile.mkdtemp()
     out_file = os.path.join(work, "out.txt")
-    cmd = [c.replace("{out}", out_file) for c in v["command"]]
+    cmd = [os.path.expanduser(c.replace("{out}", out_file)) for c in v["command"]]
     if not v.get("stdin"):
         cmd = [c.replace("{prompt}", prompt) for c in cmd]
     try:
