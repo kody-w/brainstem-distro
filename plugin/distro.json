@@ -1,0 +1,11 @@
+{
+  "id": "my-distro",
+  "display_name": "My Brainstem",
+  "version": "0.1.0",
+  "engine": {
+    "url": "http://127.0.0.1:7071",
+    "install_hint": "Install the Brainstem first: curl -fsSL https://kody-w.github.io/rapp-installer/install.sh | bash"
+  },
+  "agents_dir": null,
+  "connect_domains": ["https://raw.githubusercontent.com"]
+}

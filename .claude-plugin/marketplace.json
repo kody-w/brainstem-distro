@@ -1,0 +1,8 @@
+{
+  "name": "my-distro",
+  "owner": { "name": "you" },
+  "metadata": { "description": "My Brainstem distro as a plugin.", "version": "0.1.0" },
+  "plugins": [
+    { "name": "my-distro", "description": "My Brainstem in this AI tool: its own chat window and agents, running on this machine.", "version": "0.1.0", "source": "./plugin" }
+  ]
+}

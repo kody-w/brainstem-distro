@@ -1,0 +1,14 @@
+{
+  "name": "distro-host-test",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild host.js --bundle --format=esm --outfile=host.bundle.js --log-level=warning",
+    "test": "npm run build && node run.mjs ../../plugin"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/ext-apps": "1.7.5",
+    "esbuild": "^0.25.0",
+    "playwright": "^1.55.0"
+  }
+}

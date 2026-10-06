@@ -1,0 +1,6 @@
+{
+  "name": "my-distro",
+  "version": "0.1.0",
+  "description": "My Brainstem in this AI tool: its own chat window and agents, running on this machine.",
+  "author": { "name": "you" }
+}
