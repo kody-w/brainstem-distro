@@ -319,8 +319,13 @@ def run_voice(name):
         if not key:
             return None, "no API key"
         body = json.dumps({"model": v["model"], "messages": [{"role": "user", "content": prompt}], "max_tokens": 600}).encode()
-        req = urllib.request.Request(v.get("base_url", "https://openrouter.ai/api/v1").rstrip("/") + "/chat/completions", data=body,
-                                     headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
+        headers = {"Content-Type": "application/json", "Authorization": "Bearer " + key}
+        att = DISTRO.get("attribution") or {}  # so the provider credits these calls to the distro's app, like the engine's own
+        if att.get("url"):
+            headers["HTTP-Referer"] = att["url"]
+        if att.get("title"):
+            headers["X-OpenRouter-Title"] = headers["X-Title"] = att["title"]
+        req = urllib.request.Request(v.get("base_url", "https://openrouter.ai/api/v1").rstrip("/") + "/chat/completions", data=body, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=int(v.get("timeout", 120))) as r:
                 text = (json.load(r)["choices"][0]["message"]["content"] or "").strip()
