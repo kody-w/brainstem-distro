@@ -109,3 +109,31 @@
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start); else start();
 })();
+
+// One conversation for everyone. The window shows what was said before it opened, then follows turns that
+// arrive from the AI tool (its `chat` tool) while it is open. Its own turns the page already draws itself.
+(function () {
+  var seen = -1;
+  function draw(t, mine) {
+    if (typeof appendMsg !== 'function') return;
+    var said = mine ? t.text : t.who + ': ' + t.text;
+    appendMsg('user', said);
+    appendMsg('assistant', t.reply, t.agent_logs && String(t.agent_logs).trim() ? t.agent_logs : null);
+    try { history.push({ role: 'user', content: said }, { role: 'assistant', content: t.reply }); } catch (e) {}
+  }
+  async function poll() {
+    try {
+      var r = await window.fetch('/distro/thread?after=' + Math.max(seen, 0));
+      var turns = (await r.json()).turns || [];
+      for (var i = 0; i < turns.length; i++) {
+        var t = turns[i];
+        if (seen < 0 || t.who !== 'window') draw(t, t.who === 'window');
+        seen = Math.max(seen, t.n);
+      }
+      if (seen < 0) seen = 0;
+    } catch (e) {}
+    setTimeout(poll, 2000);
+  }
+  function start() { setTimeout(poll, 300); }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start); else start();
+})();

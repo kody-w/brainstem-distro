@@ -34,6 +34,7 @@ Click **Use this template** to start one.
 ## What every distro can do
 
 - **Open its window** inside the AI tool: the kernel's own chat page, connected to your engine.
+- **One conversation for everyone.** You in the window, and every AI tool that has the plugin (Claude, Cursor, Codex, VS Code...), talk to the same engine `/chat` in one shared conversation. Each AI's turns are tagged with its name, the window shows them as they happen, and each AI's `chat` answer includes what you said in the window since it last spoke. It's a group chat with all your AIs.
 - **Learn new skills from the AI tool.** The `add_agent` tool lets Claude (or any host) write an agent file and install it. If the file doesn't load, the host gets the error back and the file is removed, so the host can fix the code and try again.
 - **Keep the AI tool in the loop.** What people ask in the window, and the agents they add or remove, goes back to the host as context, so it knows what just happened without anyone pasting it.
 - **Run a scripted demo.** Point `"demo"` in `distro.json` at a file like `{"steps": ["What can you do? Answer in under 80 words.", "..."]}`. In the message box the up arrow loads the next step, the down arrow goes back, and Enter sends it. Keep every step short enough that the answer fits on one screen.

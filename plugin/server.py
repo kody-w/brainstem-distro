@@ -48,13 +48,22 @@ def _free_port():
 def engine():
     """The engine's base URL, starting it the first time it is needed."""
     with _lock:
-        if _engine["url"] and (_engine["proc"] is None or _engine["proc"].poll() is None):
+        if _engine["url"] and (_engine["proc"].poll() is None if _engine["proc"] else _healthy(_engine["url"])):
             return _engine["url"]
+        _engine.update(url=None, proc=None)
         eng = DISTRO["engine"]
         url = os.environ.get("DISTRO_ENGINE_URL") or eng.get("url")
         if url and _healthy(url.rstrip("/")):
             _engine["url"] = url.rstrip("/")
             return _engine["url"]
+        shared = os.path.join(CACHE, "engine.json")  # an engine another AI tool already started
+        try:
+            url = json.load(open(shared))["url"]
+            if _healthy(url):
+                _engine["url"] = url
+                return url
+        except Exception:
+            pass
         if not eng.get("command"):
             raise RuntimeError(f"No engine answering at {url}. {eng.get('install_hint', '')}".strip())
         port = _free_port()
@@ -74,6 +83,7 @@ def engine():
             proc.terminate()
             raise RuntimeError(f"The engine did not answer in 10 seconds; see {CACHE}/engine.log")
         _engine.update(url=url, proc=proc)
+        json.dump({"url": url, "pid": proc.pid}, open(shared, "w"))
         return url
 
 
@@ -91,6 +101,76 @@ def call_engine(method, path, body=None, timeout=600, file=None):
             return r.status, r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode("utf-8", "replace")
+
+
+# ---------- one conversation shared by everyone: the person in the window, and the AI tool through `chat`
+THREAD_MAX = 60
+_thread_lock = threading.Lock()
+
+
+class _locked:
+    """Held across processes too: every AI tool on this machine runs its own copy of this server, sharing one conversation."""
+    def __enter__(self):
+        _thread_lock.acquire()
+        os.makedirs(CACHE, exist_ok=True)
+        self.f = open(os.path.join(CACHE, "thread.lock"), "a")
+        try:
+            import fcntl
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+        except ImportError:  # Windows: msvcrt locks a byte range
+            import msvcrt
+            self.f.seek(0)
+            msvcrt.locking(self.f.fileno(), msvcrt.LK_LOCK, 1)
+        return self
+
+    def __exit__(self, *a):
+        self.f.close()  # closing releases the lock
+        _thread_lock.release()
+_host = {"name": "Assistant", "seen": 0}
+
+
+def _thread_path():
+    return os.path.join(CACHE, "thread.json")
+
+
+def load_thread():
+    try:
+        return json.load(open(_thread_path()))
+    except Exception:
+        return {"session_id": "thread-" + os.urandom(8).hex(), "turns": [], "next": 1}
+
+
+def save_thread(t):
+    os.makedirs(CACHE, exist_ok=True)
+    t["turns"] = t["turns"][-THREAD_MAX:]
+    tmp = _thread_path() + ".tmp"
+    json.dump(t, open(tmp, "w"))
+    os.replace(tmp, _thread_path())
+
+
+def say(who, text):
+    """One turn in the shared conversation: send it to the engine's /chat with the whole shared history."""
+    with _locked():
+        t = load_thread()
+    history = []
+    for turn in t["turns"]:
+        history.append({"role": "user", "content": turn["text"] if turn["who"] == "window" else f"[{turn['who']}] {turn['text']}"})
+        history.append({"role": "assistant", "content": turn["reply"]})
+    user_input = text if who == "window" else f"[{who}] {text}"
+    status, body = call_engine("POST", "/chat", json.dumps({"user_input": user_input, "conversation_history": history, "session_id": t["session_id"]}))
+    if status == 200:
+        d = json.loads(body)
+        with _locked():
+            t = load_thread()
+            t["turns"].append({"n": t["next"], "who": who, "text": text, "reply": d.get("response", ""), "agent_logs": d.get("agent_logs") or ""})
+            t["next"] += 1
+            save_thread(t)
+    return status, body
+
+
+def turns_after(n):
+    with _locked():
+        return [x for x in load_thread()["turns"] if x["n"] > n]
 
 
 # ---------- agents, for engines that keep only /chat and /health
@@ -128,6 +208,17 @@ def http_tool(args):
     method, path = (args.get("method") or "GET").upper(), args.get("path") or "/"
     if not path.startswith("/") or ".." in path:
         return 400, json.dumps({"error": "bad path"})
+    if method == "POST" and path == "/chat":
+        try:
+            text = json.loads(args.get("body") or "{}").get("user_input", "")
+        except ValueError:
+            text = ""
+        if not isinstance(text, str) or not text.strip():
+            return 400, json.dumps({"error": "user_input is required"})
+        return say("window", text)
+    if method == "GET" and path.startswith("/distro/thread"):
+        m = re.search(r"after=(\d+)", path)
+        return 200, json.dumps({"turns": turns_after(int(m.group(1)) if m else 0)})
     file = args.get("file")
     if file and not re.fullmatch(r"[\w.-]+\.py", str(file.get("name", ""))):
         return 400, json.dumps({"status": "error", "error": "Choose a single .py agent file."})
@@ -184,10 +275,15 @@ def tools():
          "inputSchema": {"type": "object", "properties": {}},
          "annotations": {"readOnlyHint": True},
          "_meta": {"ui": ui, "ui/resourceUri": UI_URI, "openai/outputTemplate": UI_URI}},
-        {"name": "chat", "title": f"Ask {name}",
-         "description": f"Send a message to {name} and get its answer. {name} runs the user's own agents on their machine.",
-         "inputSchema": {"type": "object", "required": ["message"], "properties": {
-             "message": {"type": "string"}, "session_id": {"type": "string"}}}},
+        {"name": "chat", "title": f"Talk to {name}",
+         "description": (f"Say something to {name}, the user's own AI, in the one conversation the user, you and {name} share. "
+                         f"The user talks to {name} in its window; you talk to it here; everyone sees the whole conversation. "
+                         f"The answer also includes anything the user said in the window since you last spoke."),
+         "inputSchema": {"type": "object", "required": ["message"], "properties": {"message": {"type": "string"}}}},
+        {"name": "conversation", "title": f"Read the conversation with {name}",
+         "description": f"Read the latest turns of the shared conversation between the user, you and {name}.",
+         "inputSchema": {"type": "object", "properties": {"last": {"type": "integer", "description": "how many turns (default 10)"}}},
+         "annotations": {"readOnlyHint": True}},
         {"name": "add_agent", "title": f"Teach {name} a new skill",
          "description": (f"Install a new agent into {name}; it is usable right away, in the chat window and through the chat tool. "
                          "Write a complete single-file Python agent: `from agents.basic_agent import BasicAgent`, one class that subclasses "
@@ -211,18 +307,29 @@ def call_tool(name, args):
         engine()
         return {"content": [{"type": "text", "text": f"{DISTRO['display_name']} is open."}]}
     if name == "chat":
-        body = {"user_input": args.get("message", ""), "conversation_history": []}
-        if args.get("session_id"):
-            body["session_id"] = args["session_id"]
-        status, text = call_engine("POST", "/chat", json.dumps(body))
+        message = args.get("message", "")
+        if not message.strip():
+            return {"content": [{"type": "text", "text": "message is required"}], "isError": True}
+        missed = [x for x in turns_after(_host["seen"]) if x["who"] == "window"]
+        status, text = say(_host["name"], message)
         try:
             d = json.loads(text)
         except ValueError:
             d = {"error": text[:500]}
         if status != 200:
             return {"content": [{"type": "text", "text": d.get("error") or f"The engine answered {status}."}], "isError": True}
-        return {"content": [{"type": "text", "text": d.get("response", "")}],
-                "structuredContent": {"response": d.get("response", ""), "session_id": d.get("session_id")}}
+        latest = turns_after(0)
+        _host["seen"] = latest[-1]["n"] if latest else 0
+        out = d.get("response", "")
+        if missed:
+            out = ("Since you last spoke, the user said in the window:\n" +
+                   "\n".join(f"- user: {x['text'][:400]}\n  {DISTRO['display_name']}: {x['reply'][:600]}" for x in missed) +
+                   f"\n\n{DISTRO['display_name']} now answers you:\n" + out)
+        return {"content": [{"type": "text", "text": out}],
+                "structuredContent": {"response": d.get("response", ""), "user_in_window": [{"text": x["text"], "reply": x["reply"]} for x in missed]}}
+    if name == "conversation":
+        turns = turns_after(0)[-int(args.get("last") or 10):]
+        return {"content": [{"type": "text", "text": "\n".join(f"- {('user' if x['who'] == 'window' else x['who'])}: {x['text'][:400]}\n  {DISTRO['display_name']}: {x['reply'][:600]}" for x in turns) or "No conversation yet."}]}
     if name == "add_agent":
         fname = args.get("filename", "")
         if not re.fullmatch(r"[a-z0-9_]+_agent\.py", fname):
@@ -243,9 +350,20 @@ def call_tool(name, args):
     raise KeyError(name)
 
 
+def host_name(client):
+    c = client.lower()
+    for key, name in (("claude", "Claude"), ("chatgpt", "ChatGPT"), ("openai", "ChatGPT"), ("codex", "Codex"),
+                      ("cursor", "Cursor"), ("copilot", "Copilot"), ("visual studio code", "Copilot"), ("vscode", "Copilot")):
+        if key in c:
+            return name
+    return "Assistant"
+
+
 def handle(msg):
     method, params = msg.get("method"), msg.get("params") or {}
     if method == "initialize":
+        _host["name"] = host_name((params.get("clientInfo") or {}).get("name", ""))
+        _host["seen"] = (turns_after(0) or [{"n": 0}])[-1]["n"]
         return {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
                 "capabilities": {"tools": {}, "resources": {},
                                  "extensions": {"io.modelcontextprotocol/ui": {}}},

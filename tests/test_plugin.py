@@ -38,7 +38,8 @@ for name in os.listdir(ROOT):
     src = os.path.join(ROOT, name)
     os.symlink(src, os.path.join(work, name)) if name != "distro.json" else None
 json.dump(cfg, open(os.path.join(work, "distro.json"), "w"))
-p = subprocess.Popen([sys.executable, os.path.join(work, "server.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+p = subprocess.Popen([sys.executable, os.path.join(work, "server.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                     env={**os.environ, "DISTRO_CACHE": tempfile.mkdtemp()})
 n = 0
 
 
@@ -85,7 +86,7 @@ checks = {
     "add_agent installs a new agent": not added.get("isError") and os.path.exists(os.path.join(agents, "shout_agent.py")),
     "add_agent refuses a bad filename": bad_add.get("isError") is True,
     "add_agent is visible to the model": "add_agent" in tools and "ui" not in tools["add_agent"].get("_meta", {}),
-    "chat answers from the engine": chat["structuredContent"]["response"] == "echo: hi",
+    "chat answers from the engine": chat["structuredContent"]["response"] == "echo: [Assistant] hi",
 }
 for k, v in checks.items():
     print(("PASS " if v else "FAIL ") + k)
