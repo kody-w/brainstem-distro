@@ -162,7 +162,8 @@ def app_html():
     page = kernel_page()
     bridge = open(os.path.join(HERE, "bridge.js"), encoding="utf-8").read()
     client = open(os.path.join(HERE, "vendor", "mcp-apps.js"), encoding="utf-8").read()
-    inject = (f"<script>{bridge}</script>\n"
+    labels = json.dumps(DISTRO.get("labels", [])).replace("</", "<\\/")
+    inject = (f"<script>window.__distroLabels = {labels};\n{bridge}</script>\n"
               f"<script type=\"module\">{client}\n"
               f"const app = new window.__McpApps.App({{name: {json.dumps(DISTRO['id'])}, version: {json.dumps(VERSION)}}}, {{}}, {{autoResize: false}});\n"
               f"app.connect().then(() => {{ app.sendSizeChanged({{height: {DISTRO.get('height', 680)}}}); window.__distroReady(app); }}, e => window.__distroFailed(e));</script>\n")

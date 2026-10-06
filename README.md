@@ -24,11 +24,12 @@ Click **Use this template** to start one.
 2. **Choose the engine.** Choose one of these two:
    - **The kernel itself** (the default). `"engine": {"url": "http://127.0.0.1:7071"}` uses a Brainstem that's already installed.
    - **Your own engine** that keeps the kernel's `/chat` and `/health` contract. Use `"engine": {"command": ["{python}", "{root}/engine/my_engine.py", "serve", "{port}"]}`. The plugin picks the port. If your engine doesn't serve `/agents`, set `"agents_dir"` and the plugin manages the agents folder for the chat window.
-3. **Add what your users need.** Build on top of the kernel, never inside it:
+3. **Optional: use your own name and window size.** In `distro.json`, `"labels"` swaps the words people see on the kernel's page without changing the page itself, for example `[["RAPP Brainstem", "My Brainstem"], ["Message brainstem...", "Message me..."]]`. The swaps apply in order and also cover text the page adds later. `"height"` sets the window height (default 680).
+4. **Add what your users need.** Build on top of the kernel, never inside it:
    - **Agent files:** drop agent files into the agents folder.
    - **Sidecars:** a sidecar talks to the engine only through `/chat` and `/health`.
    - **Your engine:** your own engine, as in step 2.
-4. **Check it.** Run `python3 tools/check.py` and `python3 tests/test_plugin.py`. For the real app window, run `cd tests/host && npm install && npm test`.
+5. **Check it.** Run `python3 tools/check.py` and `python3 tests/test_plugin.py`. For the real app window, run `cd tests/host && npm install && npm test`.
 
 ## How people install it
 

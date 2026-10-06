@@ -37,6 +37,8 @@ await box.fill(message); await box.press('Enter');
 await frame.waitForFunction(() => [...document.querySelectorAll('.msg.assistant:not(.typing-indicator)')].some(e => e.innerText.trim().length > 0), null, { timeout: 120000 }).catch(() => {});
 await page.waitForTimeout(1500);
 out.reply = await frame.evaluate(() => { const els = [...document.querySelectorAll('.msg.assistant:not(.typing-indicator)')]; return els.length ? els[els.length - 1].innerText.trim().slice(0, 300) : null; });
+out.seen = await frame.evaluate(() => ({ title: document.title, placeholder: document.querySelector('#input').placeholder,
+  welcome: (document.body.innerText.match(/Welcome[^\n]*/) || [''])[0], leftover: [...new Set(document.body.innerText.match(/RAPP|[Bb]rainstem/g) || [])] }));
 out.calls = calls; out.page_errors = errors;
 await page.screenshot({ path: dir + '/../card.png' });
 console.log(JSON.stringify(out, null, 2));

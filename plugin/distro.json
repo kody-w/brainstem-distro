@@ -7,5 +7,8 @@
     "install_hint": "Install the Brainstem first: curl -fsSL https://kody-w.github.io/rapp-installer/install.sh | bash"
   },
   "agents_dir": null,
-  "connect_domains": ["https://raw.githubusercontent.com"]
+  "connect_domains": [
+    "https://raw.githubusercontent.com"
+  ],
+  "labels": []
 }

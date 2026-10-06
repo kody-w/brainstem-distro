@@ -32,7 +32,7 @@ srv = ThreadingHTTPServer(("127.0.0.1", 0), Engine)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 agents = tempfile.mkdtemp()
 cfg = json.load(open(os.path.join(ROOT, "distro.json")))
-cfg.update(engine={"url": f"http://127.0.0.1:{srv.server_port}"}, agents_dir=agents)
+cfg.update(labels=[["RAPP Brainstem", "Test Distro"]], engine={"url": f"http://127.0.0.1:{srv.server_port}"}, agents_dir=agents)
 work = tempfile.mkdtemp()
 for name in os.listdir(ROOT):
     src = os.path.join(ROOT, name)
@@ -72,6 +72,7 @@ checks = {
     "http is for the app only": tools["http"]["_meta"]["ui"]["visibility"] == ["app"],
     "page is an MCP App": page["mimeType"] == "text/html;profile=mcp-app",
     "page is the kernel's, bridge in front": "window.__distroReady" in page["text"] and 'id="input"' in page["text"],
+    "labels ride along with the page": '"Test Distro"' in page["text"] and "window.__distroLabels" in page["text"],
     "page calls reach the engine": http_health["status"] == 200 and json.loads(http_health["body"])["status"] == "ok",
     "agent import lands in the agents folder": imported["status"] == 200 and landed,
     "agent delete removes it": deleted["status"] == 200 and not os.path.exists(os.path.join(agents, "hello_agent.py")),

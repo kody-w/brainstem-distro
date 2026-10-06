@@ -29,3 +29,40 @@
     return new Response(sc.body == null ? '' : sc.body, { status: sc.status || 502, headers: { 'Content-Type': 'application/json' } });
   };
 })();
+
+// Optional relabeling (distro.json "labels": [[from, to], ...], applied in order). The kernel's page stays
+// byte-for-byte unchanged; only the words people see are swapped, including text the page adds later.
+(function () {
+  var labels = window.__distroLabels || [];
+  if (!labels.length) return;
+  function swap(s) {
+    for (var i = 0; i < labels.length; i++) if (s.indexOf(labels[i][0]) >= 0) s = s.split(labels[i][0]).join(labels[i][1]);
+    return s;
+  }
+  var ATTRS = ['placeholder', 'title', 'aria-label'];
+  function relabel(root) {
+    if (root.nodeType === 3) { var t = swap(root.nodeValue); if (t !== root.nodeValue) root.nodeValue = t; return; }
+    if (root.nodeType !== 1 && root.nodeType !== 9) return;
+    var w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT), n = root;
+    do {
+      if (n.nodeType === 3) {
+        var p = n.parentNode && n.parentNode.nodeName;
+        if (p !== 'SCRIPT' && p !== 'STYLE' && p !== 'TEXTAREA') { var v = swap(n.nodeValue); if (v !== n.nodeValue) n.nodeValue = v; }
+      } else if (n.nodeType === 1) {
+        for (var i = 0; i < ATTRS.length; i++) { var a = n.getAttribute(ATTRS[i]); if (a) { var b = swap(a); if (b !== a) n.setAttribute(ATTRS[i], b); } }
+      }
+    } while ((n = w.nextNode()));
+  }
+  function start() {
+    relabel(document.body);
+    document.title = swap(document.title);
+    new MutationObserver(function (ms) {
+      ms.forEach(function (m) {
+        if (m.type === 'characterData') relabel(m.target);
+        else if (m.type === 'attributes') relabel(m.target);
+        else m.addedNodes.forEach(relabel);
+      });
+    }).observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ATTRS });
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start); else start();
+})();
