@@ -11,6 +11,24 @@
     var m = /^https?:\/\/(?:127\.0\.0\.1|localhost)(?::\d+)?(\/.*)?$/.exec(url);
     return m ? (m[1] || '/') : null;
   }
+  // Keep the AI tool aware of what happens in the window: the latest few turns and agent changes.
+  var recent = [];
+  function tell(a, args, body) {
+    var line = null;
+    try {
+      if (args.method === 'POST' && args.path === '/chat') {
+        var q = JSON.parse(args.body || '{}').user_input || '', d = JSON.parse(body || '{}');
+        line = '- asked: ' + q.slice(0, 400) + '\n  answer: ' + String(d.response || '').slice(0, 800);
+      } else if (args.method === 'POST' && args.path === '/agents/import' && args.file) line = '- added the agent file ' + args.file.name;
+      else if (args.method === 'DELETE' && args.path.indexOf('/agents/') === 0) line = '- removed the agent file ' + args.path.slice(8);
+    } catch (e) { return; }
+    if (!line) return;
+    recent.push(line); if (recent.length > 6) recent.shift();
+    var caps = a.getHostCapabilities && a.getHostCapabilities();
+    if (!caps || !caps.updateModelContext) return;
+    var name = (window.__distro || {}).name || 'the app';
+    a.updateModelContext({ content: [{ type: 'text', text: 'What the user just did in the ' + name + ' window (most recent last):\n' + recent.join('\n') }] }).catch(function () {});
+  }
   window.fetch = async function (input, init) {
     var url = typeof input === 'string' ? input : (input && input.url) || String(input);
     var path = enginePath(url);
@@ -25,6 +43,7 @@
     var a = await app;
     var res = await a.callServerTool({ name: 'http', arguments: args });
     var sc = (res && res.structuredContent) || {};
+    if (sc.status === 200) tell(a, args, sc.body);
     if (res && res.isError) sc = { status: 502, body: JSON.stringify({ error: (res.content && res.content[0] && res.content[0].text) || 'The engine is not available.' }) };
     return new Response(sc.body == null ? '' : sc.body, { status: sc.status || 502, headers: { 'Content-Type': 'application/json' } });
   };
@@ -33,7 +52,7 @@
 // Optional relabeling (distro.json "labels": [[from, to], ...], applied in order). The kernel's page stays
 // byte-for-byte unchanged; only the words people see are swapped, including text the page adds later.
 (function () {
-  var labels = window.__distroLabels || [];
+  var labels = (window.__distro || {}).labels || [];
   if (!labels.length) return;
   function swap(s) {
     for (var i = 0; i < labels.length; i++) if (s.indexOf(labels[i][0]) >= 0) s = s.split(labels[i][0]).join(labels[i][1]);
@@ -63,6 +82,30 @@
         else m.addedNodes.forEach(relabel);
       });
     }).observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ATTRS });
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start); else start();
+})();
+
+// Demo mode (distro.json "demo" points at {"steps": [...]}): in the message box, the up arrow loads the next
+// scripted step, the down arrow goes back, Enter sends it as usual.
+(function () {
+  var steps = (window.__distro || {}).demo || [];
+  if (!steps.length) return;
+  var at = -1;
+  function start() {
+    var box = document.getElementById('input');
+    if (!box) return;
+    box.setAttribute('placeholder', box.getAttribute('placeholder') + '  (\u2191 next demo step)');
+    box.addEventListener('keydown', function (e) {
+      if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+      var v = box.value;
+      if (v && (at < 0 || v !== steps[at])) return;  // the person is editing their own text; leave the arrows alone
+      if (e.key === 'ArrowUp') { if (v === steps[at] || at < 0 || !v) at = Math.min(at + 1, steps.length - 1); }
+      else at = Math.max(at - 1, -1);
+      box.value = at < 0 ? '' : steps[at];
+      box.dispatchEvent(new Event('input', { bubbles: true }));
+      e.preventDefault(); e.stopImmediatePropagation();
+    }, true);
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start); else start();
 })();

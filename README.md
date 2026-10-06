@@ -31,6 +31,13 @@ Click **Use this template** to start one.
    - **Your engine:** your own engine, as in step 2.
 5. **Check it.** Run `python3 tools/check.py` and `python3 tests/test_plugin.py`. For the real app window, run `cd tests/host && npm install && npm test`.
 
+## What every distro can do
+
+- **Open its window** inside the AI tool: the kernel's own chat page, connected to your engine.
+- **Learn new skills from the AI tool.** The `add_agent` tool lets Claude (or any host) write an agent file and install it. If the file doesn't load, the host gets the error back and the file is removed, so the host can fix the code and try again.
+- **Keep the AI tool in the loop.** What people ask in the window, and the agents they add or remove, goes back to the host as context, so it knows what just happened without anyone pasting it.
+- **Run a scripted demo.** Point `"demo"` in `distro.json` at a file like `{"steps": ["What can you do? Answer in under 80 words.", "..."]}`. In the message box the up arrow loads the next step, the down arrow goes back, and Enter sends it. Keep every step short enough that the answer fits on one screen.
+
 ## How people install it
 
 - **Claude Code:** run `/plugin marketplace add <you>/<your-repo>`, then `/plugin install <id>@<id>`.

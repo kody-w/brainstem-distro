@@ -33,12 +33,15 @@ const frame = page.frames().find(f => f !== page.mainFrame());
 const errors = []; page.on('pageerror', e => errors.push(String(e)));
 await frame.waitForSelector('#input', { timeout: 20000 });
 const box = await frame.$('#input');
+out.demo_first_step = await frame.evaluate(() => (window.__distro.demo || []).length ? (document.getElementById('input').value = '', true) : null);
+if (out.demo_first_step) { await box.focus(); await box.press('ArrowUp'); out.demo_first_step = await box.inputValue(); await box.press('ArrowDown'); out.demo_back_clears = (await box.inputValue()) === ''; }
 await box.fill(message); await box.press('Enter');
 await frame.waitForFunction(() => [...document.querySelectorAll('.msg.assistant:not(.typing-indicator)')].some(e => e.innerText.trim().length > 0), null, { timeout: 120000 }).catch(() => {});
 await page.waitForTimeout(1500);
 out.reply = await frame.evaluate(() => { const els = [...document.querySelectorAll('.msg.assistant:not(.typing-indicator)')]; return els.length ? els[els.length - 1].innerText.trim().slice(0, 300) : null; });
 out.seen = await frame.evaluate(() => ({ title: document.title, placeholder: document.querySelector('#input').placeholder,
   welcome: (document.body.innerText.match(/Welcome[^\n]*/) || [''])[0], leftover: [...new Set(document.body.innerText.match(/RAPP|[Bb]rainstem/g) || [])] }));
+out.model_context = await page.evaluate(() => { const m = window.modelContext; return m.length ? m[m.length - 1].content[0].text.slice(0, 300) : null; });
 out.calls = calls; out.page_errors = errors;
 await page.screenshot({ path: dir + '/../card.png' });
 console.log(JSON.stringify(out, null, 2));

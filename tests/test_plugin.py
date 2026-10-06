@@ -64,6 +64,9 @@ listed = json.loads(tool("http", {"path": "/agents"})["structuredContent"]["body
 deleted = tool("http", {"method": "DELETE", "path": "/agents/hello_agent.py"})["structuredContent"]
 escape = tool("http", {"path": "/../etc/passwd"})["structuredContent"]
 chat = tool("chat", {"message": "hi"})
+good_agent = "from agents.basic_agent import BasicAgent\n\nclass ShoutAgent(BasicAgent):\n    pass\n"
+added = tool("add_agent", {"filename": "shout_agent.py", "code": good_agent})
+bad_add = tool("add_agent", {"filename": "Shout.py", "code": good_agent})
 p.stdin.close(); p.wait(timeout=10)
 
 checks = {
@@ -72,13 +75,16 @@ checks = {
     "http is for the app only": tools["http"]["_meta"]["ui"]["visibility"] == ["app"],
     "page is an MCP App": page["mimeType"] == "text/html;profile=mcp-app",
     "page is the kernel's, bridge in front": "window.__distroReady" in page["text"] and 'id="input"' in page["text"],
-    "labels ride along with the page": '"Test Distro"' in page["text"] and "window.__distroLabels" in page["text"],
+    "labels ride along with the page": '"Test Distro"' in page["text"] and "window.__distro = " in page["text"],
     "page calls reach the engine": http_health["status"] == 200 and json.loads(http_health["body"])["status"] == "ok",
     "agent import lands in the agents folder": imported["status"] == 200 and landed,
     "agent delete removes it": deleted["status"] == 200 and not os.path.exists(os.path.join(agents, "hello_agent.py")),
     "only plain .py agent names are accepted": bad_name["status"] == 400,
     "agent list shows the agent's class": listed["files"] == [{"filename": "hello_agent.py", "agents": ["HelloAgent"]}],
     "paths outside the engine are refused": escape["status"] == 400,
+    "add_agent installs a new agent": not added.get("isError") and os.path.exists(os.path.join(agents, "shout_agent.py")),
+    "add_agent refuses a bad filename": bad_add.get("isError") is True,
+    "add_agent is visible to the model": "add_agent" in tools and "ui" not in tools["add_agent"].get("_meta", {}),
     "chat answers from the engine": chat["structuredContent"]["response"] == "echo: hi",
 }
 for k, v in checks.items():

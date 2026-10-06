@@ -162,8 +162,11 @@ def app_html():
     page = kernel_page()
     bridge = open(os.path.join(HERE, "bridge.js"), encoding="utf-8").read()
     client = open(os.path.join(HERE, "vendor", "mcp-apps.js"), encoding="utf-8").read()
-    labels = json.dumps(DISTRO.get("labels", [])).replace("</", "<\\/")
-    inject = (f"<script>window.__distroLabels = {labels};\n{bridge}</script>\n"
+    demo = []
+    if DISTRO.get("demo") and os.path.exists(os.path.join(HERE, DISTRO["demo"])):
+        demo = json.load(open(os.path.join(HERE, DISTRO["demo"]))).get("steps", [])
+    page_cfg = json.dumps({"name": DISTRO["display_name"], "labels": DISTRO.get("labels", []), "demo": demo}).replace("</", "<\\/")
+    inject = (f"<script>window.__distro = {page_cfg};\n{bridge}</script>\n"
               f"<script type=\"module\">{client}\n"
               f"const app = new window.__McpApps.App({{name: {json.dumps(DISTRO['id'])}, version: {json.dumps(VERSION)}}}, {{}}, {{autoResize: false}});\n"
               f"app.connect().then(() => {{ app.sendSizeChanged({{height: {DISTRO.get('height', 680)}}}); window.__distroReady(app); }}, e => window.__distroFailed(e));</script>\n")
@@ -185,6 +188,15 @@ def tools():
          "description": f"Send a message to {name} and get its answer. {name} runs the user's own agents on their machine.",
          "inputSchema": {"type": "object", "required": ["message"], "properties": {
              "message": {"type": "string"}, "session_id": {"type": "string"}}}},
+        {"name": "add_agent", "title": f"Teach {name} a new skill",
+         "description": (f"Install a new agent into {name}; it is usable right away, in the chat window and through the chat tool. "
+                         "Write a complete single-file Python agent: `from agents.basic_agent import BasicAgent`, one class that subclasses "
+                         "BasicAgent, whose __init__ calls super().__init__(name=<Name>, metadata={'name': <Name>, 'description': <when to use it>, "
+                         "'parameters': <JSON schema>}), and whose perform(self, **kwargs) returns a string. Standard library only. "
+                         "If it fails to load, the error comes back: fix the code and call again with the same filename."),
+         "inputSchema": {"type": "object", "required": ["filename", "code"], "properties": {
+             "filename": {"type": "string", "description": "snake_case name ending in _agent.py, e.g. expense_report_agent.py"},
+             "code": {"type": "string", "description": "the whole agent file"}}}},
         {"name": "http", "title": "Chat window connection",
          "description": "Used only by the chat window to reach its engine.",
          "inputSchema": {"type": "object", "required": ["path"], "properties": {
@@ -211,6 +223,20 @@ def call_tool(name, args):
             return {"content": [{"type": "text", "text": d.get("error") or f"The engine answered {status}."}], "isError": True}
         return {"content": [{"type": "text", "text": d.get("response", "")}],
                 "structuredContent": {"response": d.get("response", ""), "session_id": d.get("session_id")}}
+    if name == "add_agent":
+        fname = args.get("filename", "")
+        if not re.fullmatch(r"[a-z0-9_]+_agent\.py", fname):
+            return {"content": [{"type": "text", "text": "The filename must be snake_case and end in _agent.py."}], "isError": True}
+        status, text = http_tool({"method": "POST", "path": "/agents/import", "file": {"name": fname, "text": args.get("code", "")}})
+        if status != 200:
+            return {"content": [{"type": "text", "text": f"Install failed ({status}): {text[:500]}"}], "isError": True}
+        health = json.loads(call_engine("GET", "/health")[1])
+        problems = [q for q in health.get("quarantined", []) if fname in q]
+        if problems:  # take a file that does not load back out, so a failed attempt never lingers
+            http_tool({"method": "DELETE", "path": "/agents/" + fname})
+            return {"content": [{"type": "text", "text": "It did not load, so it was not installed: " + "; ".join(problems)[:800]}], "isError": True}
+        return {"content": [{"type": "text", "text": f"Installed {fname}. {DISTRO['display_name']} now has: {', '.join(health.get('agents', []))}."}],
+                "structuredContent": {"installed": fname, "agents": health.get("agents", [])}}
     if name == "http":
         status, text = http_tool(args)
         return {"content": [{"type": "text", "text": f"{status}"}], "structuredContent": {"status": status, "body": text}}
