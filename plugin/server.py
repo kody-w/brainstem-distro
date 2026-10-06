@@ -155,7 +155,7 @@ def say(who, text):
     with _locked():
         t = load_thread()
     history = []
-    avail = voices_available()
+    avail = {n: v for n, v in voices_available().items() if usable(n, v)}
     if avail:
         history += [{"role": "user", "content": f"(Group chat) Besides the user, these AIs can join: {', '.join('@' + n for n in avail)}. "
                                                 "Mention one with @Name in your reply to bring them in; they see the whole conversation. "
@@ -194,6 +194,53 @@ _auto = {"goal": None, "driver_waiting": False}
 def voices_available():
     import shutil
     return {n: v for n, v in VOICES.items() if (v.get("kind") == "api" and _api_key(v)) or (v.get("command") and shutil.which(v["command"][0]))}
+
+
+# ---------- restriction flags per AI. "cost": "free" | "subscription" (the user's own plan, no new spend) | "paid"
+# (spends money per call). Paid AIs stay out until the person allows them by name; an AI driving the distro cannot.
+def _allow_path():
+    return os.path.join(CACHE, "allow.json")
+
+
+def allowed():
+    try:
+        return set(json.load(open(_allow_path())))
+    except Exception:
+        return set()
+
+
+def set_allowed(names):
+    os.makedirs(CACHE, exist_ok=True)
+    json.dump(sorted(names), open(_allow_path(), "w"))
+
+
+def usable(name, v):
+    return v.get("cost", "paid" if v.get("kind") == "api" else "subscription") != "paid" or name in allowed()
+
+
+def flags(name, v):
+    cost = v.get("cost", "paid" if v.get("kind") == "api" else "subscription")
+    return {"cost": cost, "allowed": usable(name, v), "privacy_gate": v.get("gate") == "redact",
+            "tools": "none", "how": "API " + v.get("model", "") if v.get("kind") == "api" else "its own app, signed in"}
+
+
+def spend_command(text, speaker):
+    """'allow @Grok' / 'allow paid' / 'free only': only the person can change who may spend money."""
+    if speaker != "window":
+        return None
+    t = text.strip().lower()
+    if t.startswith("free only") or t.startswith("no paid"):
+        set_allowed(set())
+        return "Free only: paid AIs are out until you allow them again."
+    m = re.match(r"allow\s+(.+)", t)
+    if not m:
+        return None
+    paid = [n for n, v in VOICES.items() if not usable(n, v) or n in allowed()]
+    names = paid if "paid" in m.group(1) or "all" in m.group(1) else [n for n in VOICES if n.lower() in m.group(1)]
+    if not names:
+        return None
+    set_allowed(allowed() | set(names))
+    return "Allowed (these cost money per call): " + ", ".join(names) + ". Say 'free only' to stop."
 
 
 def transcript(limit=30):
@@ -371,6 +418,11 @@ def follow_mentions(text, speaker):
         names = {m.lower() for m in MENTION.findall(text)}
         want = [n for n in avail if n.lower() in names or names & {"all", "everyone"}]
         want = [n for n in want if n != speaker and joined.get(n, 0) < 2]  # nobody is pulled in more than twice per message
+        for n in [n for n in want if not usable(n, avail[n])]:
+            if not joined.get(n):
+                notify(f"{n} costs money per call, so it was left out. Say 'allow @{n}' to let it in.", final=False)
+            joined[n] = 99
+        want = [n for n in want if usable(n, avail[n])]
         if _auto["goal"] and (not want or joined):  # on autopilot, check after every round whether it is done or needs the person
             status, body = say("Autopilot", f"Goal: {_auto['goal']}. Decide the next step. Mention who should act with @Name, "
                                             "or answer starting NEED_USER: <question> if only the user can decide, or DONE: <summary> if the goal is met.")
@@ -485,6 +537,9 @@ def http_tool(args):
             text = ""
         if not isinstance(text, str) or not text.strip():
             return 400, json.dumps({"error": "user_input is required"})
+        answer = spend_command(text, "window")
+        if answer:
+            return 200, json.dumps({"response": answer, "agent_logs": ""})
         status, body = say("window", text)
         if status == 200:
             after_turn(text, json.loads(body).get("response", ""), "window")
@@ -559,6 +614,9 @@ def tools():
                          f"answer NEED_USER questions yourself when you can, by calling chat, and only involve the user when you must."),
          "inputSchema": {"type": "object", "required": ["goal"], "properties": {
              "goal": {"type": "string"}, "wait": {"type": "boolean", "description": "wait for the result (default true)"}}}},
+        {"name": "voices", "title": f"Who {name} can bring in",
+         "description": "List the other AIs the distro can bring into the conversation, with their restriction flags: cost (free, subscription, paid), whether paid ones are allowed, the privacy gate, and tools (always none). Only the user can allow paid AIs, in the window.",
+         "inputSchema": {"type": "object", "properties": {}}, "annotations": {"readOnlyHint": True}},
         {"name": "conversation", "title": f"Read the conversation with {name}",
          "description": f"Read the latest turns of the shared conversation between the user, you and {name}.",
          "inputSchema": {"type": "object", "properties": {"last": {"type": "integer", "description": "how many turns (default 10)"}}},
@@ -608,6 +666,13 @@ def call_tool(name, args):
                    f"\n\n{DISTRO['display_name']} now answers you:\n" + out)
         return {"content": [{"type": "text", "text": out}],
                 "structuredContent": {"response": d.get("response", ""), "since_you_spoke": [{"who": x["who"], "text": x["text"], "reply": x.get("reply", "")} for x in missed]}}
+    if name == "voices":
+        avail = voices_available()
+        rows = {n: {**flags(n, v), "installed": n in avail} for n, v in VOICES.items()}
+        return {"content": [{"type": "text", "text": "\n".join(f"- {n}: {f['cost']}, {'allowed' if f['allowed'] else 'not allowed (paid)'}"
+                                                          f"{', privacy gate' if f['privacy_gate'] else ''}, tools: none"
+                                                          f"{'' if f['installed'] else ', not set up on this machine'}" for n, f in rows.items()) or "No other AIs set up."}],
+                "structuredContent": {"voices": rows}}
     if name == "take_over":
         return take_over(args.get("goal", ""), args.get("wait", True))
     if name == "conversation":
@@ -718,6 +783,8 @@ def cli(argv):
         r = call_tool("chat", {"message": " ".join(argv[1:])})
     elif argv[0] == "--take-over":
         r = take_over(" ".join(argv[1:]))
+    elif argv[0] == "--voices":
+        r = call_tool("voices", {})
     else:
         r = call_tool("conversation", {"last": int(argv[1]) if len(argv) > 1 else 10})
     for t in threading.enumerate():  # let the AIs it brought in finish before this process exits
@@ -731,7 +798,7 @@ def cli(argv):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] in ("--say", "--take-over", "--conversation"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("--say", "--take-over", "--conversation", "--voices"):
         sys.exit(cli(sys.argv[1:]))
     if "--check" in sys.argv:
         report = {"engine": engine(), "health": json.loads(call_engine("GET", "/health")[1]), "page_bytes": len(app_html().encode())}

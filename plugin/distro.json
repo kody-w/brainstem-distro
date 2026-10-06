@@ -23,7 +23,8 @@
         "--output-format",
         "text"
       ],
-      "stdin": true
+      "stdin": true,
+      "cost": "subscription"
     },
     "Codex": {
       "command": [
@@ -37,7 +38,8 @@
         "{out}",
         "-"
       ],
-      "stdin": true
+      "stdin": true,
+      "cost": "subscription"
     },
     "Copilot": {
       "command": [
@@ -47,7 +49,8 @@
         "-s",
         "--available-tools",
         ""
-      ]
+      ],
+      "cost": "subscription"
     }
   },
   "max_rounds": 6

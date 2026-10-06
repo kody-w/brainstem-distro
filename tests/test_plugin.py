@@ -32,6 +32,8 @@ srv = ThreadingHTTPServer(("127.0.0.1", 0), Engine)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 agents = tempfile.mkdtemp()
 cfg = json.load(open(os.path.join(ROOT, "distro.json")))
+cfg["voices"] = {"PaidBot": {"kind": "api", "model": "x/y", "cost": "paid"}}
+os.environ["OPENROUTER_API_KEY"] = "test-not-a-real-key"
 cfg.update(labels=[["RAPP Brainstem", "Test Distro"]], engine={"url": f"http://127.0.0.1:{srv.server_port}"}, agents_dir=agents)
 work = tempfile.mkdtemp()
 for name in os.listdir(ROOT):
@@ -65,6 +67,14 @@ listed = json.loads(tool("http", {"path": "/agents"})["structuredContent"]["body
 deleted = tool("http", {"method": "DELETE", "path": "/agents/hello_agent.py"})["structuredContent"]
 escape = tool("http", {"path": "/../etc/passwd"})["structuredContent"]
 chat = tool("chat", {"message": "hi"})
+win = lambda text: json.loads(tool("http", {"method": "POST", "path": "/chat", "body": json.dumps({"user_input": text})})["structuredContent"]["body"])["response"]
+v0 = tool("voices", {})["structuredContent"]["voices"]["PaidBot"]
+ai_allow = tool("chat", {"message": "allow @PaidBot"})
+v1 = tool("voices", {})["structuredContent"]["voices"]["PaidBot"]
+person_allow = win("allow @PaidBot")
+v2 = tool("voices", {})["structuredContent"]["voices"]["PaidBot"]
+win("free only")
+v3 = tool("voices", {})["structuredContent"]["voices"]["PaidBot"]
 good_agent = "from agents.basic_agent import BasicAgent\n\nclass ShoutAgent(BasicAgent):\n    pass\n"
 added = tool("add_agent", {"filename": "shout_agent.py", "code": good_agent})
 bad_add = tool("add_agent", {"filename": "Shout.py", "code": good_agent})
@@ -86,6 +96,10 @@ checks = {
     "add_agent installs a new agent": not added.get("isError") and os.path.exists(os.path.join(agents, "shout_agent.py")),
     "add_agent refuses a bad filename": bad_add.get("isError") is True,
     "add_agent is visible to the model": "add_agent" in tools and "ui" not in tools["add_agent"].get("_meta", {}),
+    "paid AIs start out not allowed": v0["cost"] == "paid" and v0["allowed"] is False,
+    "an AI cannot allow spending": v1["allowed"] is False,
+    "the person can allow a paid AI by name": "Allowed" in person_allow and v2["allowed"] is True,
+    "'free only' takes it back": v3["allowed"] is False,
     "chat answers from the engine": chat["structuredContent"]["response"] == "echo: [Assistant] hi",
 }
 for k, v in checks.items():
