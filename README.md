@@ -27,7 +27,10 @@ Click **Use this template** to start one.
 The optional [`keeper/`](keeper/) script safely upgrades the unchanged
 Brainstem, rolls back a bad release, starts a known-good safe copy when the
 installer or network is unavailable, and removes cleanly without touching the
-grail install. It supports Python 3.9+ on macOS and Linux.
+grail install. Keeper can also adopt one existing GitHub sign-in per machine
+and atomically project it to an explicit allowlist of Brainstems, preventing
+independent device flows from revoking one another. It supports Python 3.9+ on
+macOS and Linux.
 
 ## Make your distro
 

@@ -20,19 +20,38 @@ Run commands with `python3 keeper/keeper.py <command>` from this repository:
 | `upgrade --to 0.6.16` | Upgrades to one explicit release. |
 | `upgrade --to 0.6.16 --force` | Retries a failed release or reinstalls a non-newer release. |
 | `watch --interval 30` | Runs `start` repeatedly and checks for an upgrade once a day. |
+| `signin status` | Shows the machine holder generation and registered Brainstems by alias, including metadata drift and newer successful sign-ins. |
+| `signin adopt [--from <dir>]` | Adopts an existing Brainstem's token record as the machine holder without starting a device flow. Defaults to the main install. |
+| `signin register <dir>` | Adds a Brainstem to the private allowlist and atomically projects the holder into it. |
+| `signin unregister <dir>` | Removes a Brainstem from the allowlist and leaves its token file untouched. |
+| `signin sync` | Adopts the newest non-failing sign-in from a registered Brainstem, then projects that generation to all registered Brainstems. |
 | `install-service` | Installs keeper as a macOS LaunchAgent or Linux systemd user service. If neither is available, prints the one command to run. |
 | `uninstall-service` | Removes only the keeper service. |
 | `uninstall` | Stops keeper-managed processes and removes `~/.brainstem/keeper/` and the keeper service. |
 
 `install-service` copies the script and the current kernel pin into
 `~/.brainstem/keeper/`, so the service does not depend on the repository staying
-in the same place.
+in the same place. When a sign-in holder exists, `watch` also runs `signin sync`
+once per cycle before checking Brainstem health.
+
+`signin` never starts OAuth, requests `offline_access`, creates refresh tokens,
+or prints credential values. Status and command results use stable aliases such
+as `main` and `brainstem-1`, generation numbers, and timestamps rather than
+registered filesystem paths. Generation matching deliberately uses only the
+holder's recorded file size and modification time; keeper never compares or
+hashes token contents.
 
 ## What keeper stores
 
 - `~/.brainstem/keeper/state.json`: last known-good release, failed releases,
   safe-copy release, and the last 20 events.
 - `~/.brainstem/keeper/keeper.log`: keeper, installer, and server output.
+- `~/.brainstem/keeper/signin/.copilot_token`: the machine's private holder
+  record.
+- `~/.brainstem/keeper/signin/generation.json`: holder generation, timestamp,
+  source alias, size, and modification time.
+- `~/.brainstem/keeper/signin/manifest.json`: the private allowlist mapping
+  stable aliases to registered Brainstem directories.
 - `~/.brainstem/keeper/carry/`: temporary 0600 copies of the kernel's sign-in
   files while the official installer runs. Copies are deleted after the files
   are safely present beside `brainstem.py` again.
@@ -46,6 +65,15 @@ session files written by the pinned kernel. Keeper never logs or hashes their
 contents. The safe server links to those existing files and the user's `.env`.
 It uses the user's agents only when they can be imported; otherwise it uses the
 agents shipped in the safe copy.
+
+The shared holder intentionally covers only `.copilot_token`. The existing
+temporary carry mechanism remains because upgrades must also preserve
+`.copilot_session`, `.copilot_pending`, and `.brainstem_secret`, and because it
+protects installs before a holder has been adopted. Holder and manifest
+directories are mode 0700 and their files are mode 0600. Projection uses a
+same-directory temporary file, file and directory `fsync`, and `os.replace`.
+`uninstall` removes the holder and manifest with the rest of keeper but never
+deletes token files from Brainstem directories.
 
 ## Upgrade and recovery behavior
 
@@ -75,4 +103,12 @@ on the configured NAS with:
 
 ```bash
 bash keeper/tests/run_e2e_on_nas.sh
+```
+
+The separate shared-sign-in proof installs one official Brainstem plus two
+token-free twins, verifies adopt/register/adopt-forward/uninstall, and can be
+launched with:
+
+```bash
+bash keeper/tests/run_signin_e2e_on_nas.sh
 ```
