@@ -22,6 +22,13 @@ Click **Use this template** to start one.
 | `tools/check.py` | Proves you stand on the kernel unchanged. |
 | `tests/` | The plugin end to end, plus a real app-window run in a browser. |
 
+## Keep Brainstem running
+
+The optional [`keeper/`](keeper/) script safely upgrades the unchanged
+Brainstem, rolls back a bad release, starts a known-good safe copy when the
+installer or network is unavailable, and removes cleanly without touching the
+grail install. It supports Python 3.9+ on macOS and Linux.
+
 ## Make your distro
 
 1. **Name it.** In `plugin/distro.json` set `id` and `display_name`. Use the same `id` in `plugin/.claude-plugin/plugin.json`, `plugin/.mcp.json` and `.claude-plugin/marketplace.json`.
