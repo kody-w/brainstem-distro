@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import os
+import socket
 import tempfile
 import threading
 import unittest
@@ -368,7 +369,81 @@ class KeeperTests(unittest.TestCase):
             self.assertFalse((tree / ".copilot_token").exists())
             self.assertFalse((tree / ".brainstem_data").exists())
 
-    def test_legacy_installer_is_stopped_before_launch(self):
+    def test_installer_carries_signin_files_without_overwriting_newer_files(self):
+        script = b"""#!/bin/bash
+set -e
+target=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --version) target="${2#brainstem-v}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+rm -rf "$HOME/.brainstem/src"
+mkdir -p "$HOME/.brainstem/src/rapp_brainstem"
+printf '%s\n' "$target" > "$HOME/.brainstem/src/rapp_brainstem/VERSION"
+printf 'new-token\n' > "$HOME/.brainstem/src/rapp_brainstem/.copilot_token"
+chmod 600 "$HOME/.brainstem/src/rapp_brainstem/.copilot_token"
+"""
+
+        class InstallerKeeper(keeper_module.Keeper):
+            def _origin_reachable(self):
+                return True, None
+
+            def _download_installer(self):
+                return script
+
+            def probe_health(self, expected_version=None, timeout=2):
+                return {"healthy": False, "reason": "not running"}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary) / "home"
+            home.mkdir()
+            kernel = home / ".brainstem" / "src" / "rapp_brainstem"
+            kernel.mkdir(parents=True)
+            original = {
+                ".brainstem_secret": b"lan-secret\n",
+                ".copilot_pending": b'{"device_code":"pending"}\n',
+                ".copilot_session": b'{"token":"session"}\n',
+                ".copilot_token": b"old-token\n",
+            }
+            for name, content in original.items():
+                path = kernel / name
+                path.write_bytes(content)
+                path.chmod(0o600)
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                keeper = InstallerKeeper(
+                    brainstem_home=home / ".brainstem"
+                )
+                keeper.installer_timeout = 10
+                keeper._carry_signin_files()
+                self.assertEqual(
+                    keeper.carry_dir.stat().st_mode & 0o777, 0o700
+                )
+                for name, content in original.items():
+                    carried = keeper.carry_dir / name
+                    self.assertEqual(carried.read_bytes(), content)
+                    self.assertEqual(carried.stat().st_mode & 0o777, 0o600)
+                succeeded, reason = keeper.run_installer("0.6.15")
+            self.assertTrue(succeeded, reason)
+            self.assertIn("without leaving a server", reason)
+            self.assertEqual(
+                (kernel / ".copilot_token").read_bytes(), b"new-token\n"
+            )
+            self.assertEqual(
+                (kernel / ".copilot_token").stat().st_mode & 0o777, 0o600
+            )
+            for name in (
+                ".brainstem_secret",
+                ".copilot_pending",
+                ".copilot_session",
+            ):
+                path = kernel / name
+                self.assertEqual(path.read_bytes(), original[name])
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertFalse(keeper.carry_dir.exists())
+
+    def test_bannerless_installer_server_is_adopted_by_contract(self):
         script = b"""#!/bin/bash
 set -e
 target=""
@@ -380,9 +455,7 @@ while [ "$#" -gt 0 ]; do
 done
 mkdir -p "$HOME/.brainstem/src/rapp_brainstem"
 printf '%s\n' "$target" > "$HOME/.brainstem/src/rapp_brainstem/VERSION"
-echo "RAPP Brainstem v${target} installed!"
-sleep 3
-touch "$HOME/legacy-launch-ran"
+exec python3 "$HOME/test-server/brainstem.py"
 """
 
         class InstallerKeeper(keeper_module.Keeper):
@@ -392,18 +465,85 @@ touch "$HOME/legacy-launch-ran"
             def _download_installer(self):
                 return script
 
+            def _port_pids(self):
+                pid_path = Path.home() / "test-server.pid"
+                if not pid_path.is_file():
+                    return set()
+                return {int(pid_path.read_text(encoding="ascii"))}
+
+            def _pid_is_brainstem(self, _pid):
+                return True
+
+        server_source = """\
+import json
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({"status": "ok", "version": os.environ["KEEPER_TEST_VERSION"]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        body = json.dumps({"error": "user_input is required"}).encode()
+        self.send_response(400)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args):
+        pass
+
+with open(os.path.expanduser("~/test-server.pid"), "w", encoding="ascii") as handle:
+    handle.write(str(os.getpid()))
+ThreadingHTTPServer(("127.0.0.1", int(os.environ["KEEPER_TEST_PORT"])), Handler).serve_forever()
+"""
+
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary) / "home"
-            home.mkdir()
-            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            server_dir = home / "test-server"
+            server_dir.mkdir(parents=True)
+            (server_dir / "brainstem.py").write_text(
+                server_source, encoding="utf-8"
+            )
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            environment = {
+                "HOME": str(home),
+                "KEEPER_TEST_PORT": str(port),
+                "KEEPER_TEST_VERSION": "0.6.15",
+            }
+            with mock.patch.dict(os.environ, environment):
                 keeper = InstallerKeeper(
                     brainstem_home=home / ".brainstem"
                 )
+                keeper.port = port
+                keeper.base_url = "http://127.0.0.1:{}".format(port)
                 keeper.installer_timeout = 10
                 succeeded, reason = keeper.run_installer("0.6.15")
-            self.assertTrue(succeeded, reason)
-            self.assertIn("unsupported launch phase", reason)
-            self.assertFalse((home / "legacy-launch-ran").exists())
+                try:
+                    self.assertTrue(succeeded, reason)
+                    self.assertIn("adopted PID", reason)
+                    adopted = keeper._read_pid(keeper.installed_pid_path)
+                    self.assertEqual(
+                        adopted,
+                        int(
+                            (home / "test-server.pid").read_text(
+                                encoding="ascii"
+                            )
+                        ),
+                    )
+                    self.assertTrue(keeper.probe_health("0.6.15")["healthy"])
+                finally:
+                    keeper._stop_pidfile(keeper.installed_pid_path)
 
     def test_default_target_reads_version_pin_and_reports_missing_pin(self):
         with tempfile.TemporaryDirectory() as temporary:

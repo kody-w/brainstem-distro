@@ -1,12 +1,9 @@
 # Brainstem keeper
 
-Keeper is a seat belt for Brainstem. It remembers the last version that worked,
-tests every upgrade before trusting it, and goes back automatically if the new
-version is broken. If the installer or network is unavailable, it can start its
-own known-good copy so the chat still comes up.
-
-Removing keeper removes only keeper. It does not edit or remove the official
-Brainstem installation.
+Keeper keeps your Brainstem chat available when an update breaks or the network
+is down. It tests updates and automatically returns to the last working
+version. It keeps your sign-in in place and can be removed without removing
+Brainstem.
 
 Keeper is a standard-library-only Python 3.9+ script for macOS and Linux.
 Windows is not supported in this release.
@@ -36,12 +33,18 @@ in the same place.
 - `~/.brainstem/keeper/state.json`: last known-good release, failed releases,
   safe-copy release, and the last 20 events.
 - `~/.brainstem/keeper/keeper.log`: keeper, installer, and server output.
+- `~/.brainstem/keeper/carry/`: temporary 0600 copies of the kernel's sign-in
+  files while the official installer runs. Copies are deleted after the files
+  are safely present beside `brainstem.py` again.
 - `~/.brainstem/keeper/safe/<version>/`: tracked kernel files only. User
   `.env`, token, data, and untracked agents are not copied.
 - `~/.brainstem/keeper/safe-venv/`: the safe copy's Python environment.
 
-The safe server links to the user's existing `.env` and `.copilot_token`. It
-uses the user's agents only when they can be imported; otherwise it uses the
+The protected sign-in files are `.copilot_token`, `.copilot_session`,
+`.copilot_pending`, and `.brainstem_secret`, matching the credential and
+session files written by the pinned kernel. Keeper never logs or hashes their
+contents. The safe server links to those existing files and the user's `.env`.
+It uses the user's agents only when they can be imported; otherwise it uses the
 agents shipped in the safe copy.
 
 ## Upgrade and recovery behavior
@@ -54,11 +57,12 @@ pass:
 2. `POST /chat` with `{}` returns a 400 JSON error without calling a model.
 
 A failed version is recorded and skipped until a higher target is available.
-Use `--force` to retry it. The currently served official installer does not yet
-honor `--no-launch`; keeper detects that installer revision and stops its
-process group immediately after the completed-install banner, before its launch
-phase can persist. Installer revisions with native `--no-launch` support run
-normally.
+Use `--force` to retry it. Keeper does not depend on installer banner wording.
+If the official installer launches Brainstem, keeper waits for the complete
+health and chat contract, verifies the expected version, and adopts the process
+holding the port. If the installer honors `--no-launch`, keeper starts the
+installed version itself afterward. A hard timeout stops only an installer that
+neither exits nor produces a healthy Brainstem.
 
 Run the unit suite with:
 

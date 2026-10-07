@@ -31,13 +31,18 @@ UPGRADE_INTERVAL = 24 * 60 * 60
 HISTORY_LIMIT = 20
 SERVICE_LABEL = "io.rapp.keeper"
 SYSTEMD_SERVICE = "rapp-keeper.service"
+SIGNIN_CARRY_NAMES = (
+    ".brainstem_secret",
+    ".copilot_pending",
+    ".copilot_session",
+    ".copilot_token",
+)
 SENSITIVE_KERNEL_NAMES = {
     ".brainstem_data",
     ".brainstem_model",
-    ".copilot_token",
     ".env",
+    *SIGNIN_CARRY_NAMES,
 }
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 class KeeperError(RuntimeError):
@@ -92,6 +97,7 @@ class Keeper:
         self.grail_venv = self.brainstem_home / "venv"
         self.launcher = Path.home() / ".local" / "bin" / "brainstem"
         self.keeper_home = self.brainstem_home / "keeper"
+        self.carry_dir = self.keeper_home / "carry"
         self.safe_root = self.keeper_home / "safe"
         self.safe_venv = self.keeper_home / "safe-venv"
         self.state_path = self.keeper_home / "state.json"
@@ -116,6 +122,14 @@ class Keeper:
         self.keeper_home.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             self.keeper_home.chmod(0o700)
+        except OSError:
+            pass
+
+    def _ensure_carry_dir(self):
+        self._ensure_keeper_home()
+        self.carry_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            self.carry_dir.chmod(0o700)
         except OSError:
             pass
 
@@ -187,25 +201,107 @@ class Keeper:
         line = "{} {}\n".format(self._timestamp(), str(message).rstrip())
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(line)
+        try:
+            self.log_path.chmod(0o600)
+        except OSError:
+            pass
         if display:
             print(str(message), flush=True)
 
-    def _write_installer_log(self, version, output):
-        if not output:
+    def _copy_private_file(self, source, destination):
+        temporary = destination.with_name(
+            ".{}.tmp-{}-{}".format(
+                destination.name.lstrip("."),
+                os.getpid(),
+                time.time_ns(),
+            )
+        )
+        source_handle = None
+        destination_handle = None
+        try:
+            source_handle = source.open("rb")
+            fd = os.open(
+                str(temporary),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            destination_handle = os.fdopen(fd, "wb")
+            shutil.copyfileobj(source_handle, destination_handle)
+            destination_handle.flush()
+            os.fsync(destination_handle.fileno())
+            destination_handle.close()
+            destination_handle = None
+            os.chmod(str(temporary), 0o600)
+            os.replace(str(temporary), str(destination))
+        finally:
+            if source_handle is not None:
+                source_handle.close()
+            if destination_handle is not None:
+                destination_handle.close()
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _carry_signin_files(self):
+        existing = [
+            name
+            for name in SIGNIN_CARRY_NAMES
+            if (self.kernel_dir / name).is_file()
+        ]
+        if not existing:
             return
-        self._ensure_keeper_home()
-        with self.log_path.open("a", encoding="utf-8") as handle:
-            handle.write(
-                "{} installer {} output begin\n".format(
-                    self._timestamp(), version
-                )
-            )
-            handle.write(output.rstrip())
-            handle.write(
-                "\n{} installer {} output end\n".format(
-                    self._timestamp(), version
-                )
-            )
+        self._ensure_carry_dir()
+        for name in existing:
+            source = self.kernel_dir / name
+            destination = self.carry_dir / name
+            try:
+                self._copy_private_file(source, destination)
+            except FileNotFoundError:
+                continue
+
+    def _restore_carried_signin_files(self, remove_restored):
+        if not self.carry_dir.is_dir():
+            return True
+        restored = True
+        for name in SIGNIN_CARRY_NAMES:
+            carried = self.carry_dir / name
+            if not carried.is_file():
+                continue
+            destination = self.kernel_dir / name
+            if not destination.exists():
+                if not self.kernel_dir.is_dir():
+                    restored = False
+                    continue
+                try:
+                    os.link(str(carried), str(destination))
+                except FileExistsError:
+                    pass
+                except OSError:
+                    restored = False
+                    continue
+            if destination.exists() and remove_restored:
+                try:
+                    carried.unlink()
+                except OSError:
+                    restored = False
+        if remove_restored:
+            try:
+                self.carry_dir.rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                restored = False
+        return restored
+
+    def _signin_guard(self, stop_event):
+        while not stop_event.wait(0.05):
+            self._restore_carried_signin_files(remove_restored=False)
+
+    def _finish_signin_guard(self, stop_event, guard_thread):
+        stop_event.set()
+        guard_thread.join(timeout=2)
+        return self._restore_carried_signin_files(remove_restored=True)
 
     @contextlib.contextmanager
     def lock(self):
@@ -524,6 +620,25 @@ class Keeper:
             )
             self._terminate_pid(pid)
 
+    def _adopt_installed_server(self, expected_version, health=None):
+        health = health or self.probe_health(expected_version, timeout=2)
+        if not health.get("healthy"):
+            return None
+        candidates = sorted(
+            pid
+            for pid in self._port_pids()
+            if pid not in (os.getpid(), os.getppid()) and pid > 1
+        )
+        if not candidates:
+            return None
+        pid = candidates[0]
+        self._write_pid(self.installed_pid_path, pid)
+        try:
+            self.safe_pid_path.unlink()
+        except FileNotFoundError:
+            pass
+        return pid
+
     def _write_pid(self, path, pid):
         self._ensure_keeper_home()
         temporary = path.with_name("{}.tmp-{}".format(path.name, os.getpid()))
@@ -568,6 +683,13 @@ class Keeper:
         return health
 
     def launch_installed(self, expected_version):
+        current = self.probe_health(expected_version, timeout=2)
+        if current["healthy"]:
+            pid = self._adopt_installed_server(expected_version, current)
+            if pid is not None:
+                return current
+            current["healthy"] = False
+            current["reason"] = "healthy installed server PID could not be adopted"
         python_path = self.grail_venv / "bin" / "python"
         environment = os.environ.copy()
         environment["PORT"] = str(self.port)
@@ -828,8 +950,8 @@ for path in sorted(glob.glob(os.path.join(root, "*_agent.py"))):
         python_path = self._safe_python()
         if not safe_tree.is_dir() or python_path is None:
             return {"healthy": False, "reason": "safe copy is incomplete"}
-        self._link_user_file(safe_tree, ".env")
-        self._link_user_file(safe_tree, ".copilot_token")
+        for name in (".env",) + SIGNIN_CARRY_NAMES:
+            self._link_user_file(safe_tree, name)
         user_agents = self.kernel_dir / "agents"
         safe_agents = safe_tree / "agents"
         agents_path = (
@@ -896,16 +1018,18 @@ for path in sorted(glob.glob(os.path.join(root, "*_agent.py"))):
 
     def run_installer(self, version):
         version = normalize_version(version)
+        self._carry_signin_files()
         reachable, reach_error = self._origin_reachable()
         if not reachable:
+            self._restore_carried_signin_files(remove_restored=True)
             return False, "grail origin is unreachable: {}".format(reach_error)
         try:
             script = self._download_installer()
         except KeeperError as exc:
+            self._restore_carried_signin_files(remove_restored=True)
             return False, str(exc)
 
         text = script.decode("utf-8", "replace")
-        native_no_launch = bool(re.search(r"--no-launch\)", text))
         command = [
             "bash",
             "-s",
@@ -914,34 +1038,47 @@ for path in sorted(glob.glob(os.path.join(root, "*_agent.py"))):
             "brainstem-v{}".format(version),
             "--no-launch",
         ]
-        output_lines = []
-        legacy_banner = threading.Event()
+        self._ensure_keeper_home()
+        log_handle = self.log_path.open("ab", buffering=0)
+        try:
+            os.chmod(str(self.log_path), 0o600)
+        except OSError:
+            pass
         try:
             process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
+                stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 text=True,
-                bufsize=1,
                 start_new_session=True,
                 env=os.environ.copy(),
             )
         except OSError as exc:
+            log_handle.close()
+            self._restore_carried_signin_files(remove_restored=True)
             return False, "cannot start the official installer: {}".format(exc)
+        finally:
+            if not log_handle.closed:
+                log_handle.close()
 
-        def read_output():
-            if process.stdout is None:
-                return
-            for line in process.stdout:
-                output_lines.append(line)
-                clean = ANSI_RE.sub("", line)
-                if not native_no_launch and "RAPP Brainstem v" in clean and "installed!" in clean:
-                    legacy_banner.set()
-                    self._terminate_installer(process)
+        stop_guard = threading.Event()
+        guard_thread = threading.Thread(
+            target=self._signin_guard,
+            args=(stop_guard,),
+            name="keeper-signin-guard",
+            daemon=True,
+        )
+        guard_thread.start()
+        guard_finished = False
 
-        reader = threading.Thread(target=read_output, daemon=True)
-        reader.start()
+        def finish_guard():
+            nonlocal guard_finished
+            if guard_finished:
+                return True
+            guard_finished = True
+            return self._finish_signin_guard(stop_guard, guard_thread)
+
         try:
             if process.stdin is not None:
                 try:
@@ -950,8 +1087,47 @@ for path in sorted(glob.glob(os.path.join(root, "*_agent.py"))):
                     pass
                 finally:
                     process.stdin.close()
-            process.wait(timeout=self.installer_timeout)
-        except subprocess.TimeoutExpired:
+            deadline = time.monotonic() + self.installer_timeout
+            while time.monotonic() < deadline:
+                health = self.probe_health(version, timeout=1)
+                if health["healthy"] and self.installed_version() == version:
+                    pid = self._adopt_installed_server(version, health)
+                    if pid is not None:
+                        if not finish_guard():
+                            self._stop_pidfile(self.installed_pid_path)
+                            return False, (
+                                "official installer launched Brainstem, but "
+                                "keeper could not restore sign-in state"
+                            )
+                        threading.Thread(
+                            target=process.wait,
+                            name="keeper-installer-reaper",
+                            daemon=True,
+                        ).start()
+                        return True, (
+                            "official installer launched healthy Brainstem; "
+                            "keeper adopted PID {}".format(pid)
+                        )
+
+                return_code = process.poll()
+                if return_code is not None:
+                    restored = finish_guard()
+                    observed = self.installed_version()
+                    if not restored:
+                        return False, (
+                            "official installer exited, but keeper could not "
+                            "restore sign-in state"
+                        )
+                    if return_code == 0 and observed == version:
+                        return True, (
+                            "official installer completed without leaving a "
+                            "server running"
+                        )
+                    return False, "official installer failed with code {}".format(
+                        return_code
+                    )
+                self.sleep(0.25)
+
             self._terminate_installer(process)
             try:
                 process.wait(timeout=5)
@@ -961,38 +1137,18 @@ for path in sorted(glob.glob(os.path.join(root, "*_agent.py"))):
                 except OSError:
                     process.kill()
                 process.wait(timeout=5)
-            reader.join(timeout=2)
-            if process.stdout is not None:
-                process.stdout.close()
-            output = "".join(output_lines)
-            self._write_installer_log(version, output)
-            return False, "official installer timed out: {}".format(
-                tail_text(output)
-            )
+            restored = finish_guard()
+            if not restored:
+                return False, (
+                    "official installer timed out and sign-in state could not "
+                    "be restored"
+                )
+            return False, "official installer timed out"
         finally:
             if process.stdin is not None and not process.stdin.closed:
                 process.stdin.close()
-        reader.join(timeout=5)
-        if process.stdout is not None:
-            process.stdout.close()
-        output = "".join(output_lines)
-        self._write_installer_log(version, output)
-        observed = self.installed_version()
-
-        if native_no_launch:
-            if process.returncode == 0 and observed == version:
-                return True, "official installer completed with --no-launch"
-            return False, "official installer failed (code {}): {}".format(
-                process.returncode, tail_text(output)
-            )
-        if legacy_banner.is_set() and observed == version:
-            return True, (
-                "official installer completed; keeper stopped its unsupported "
-                "launch phase"
-            )
-        return False, "official installer failed (code {}): {}".format(
-            process.returncode, tail_text(output)
-        )
+            if not guard_finished:
+                finish_guard()
 
     def _record_healthy_installed(self, state, version, event):
         version = normalize_version(version)
@@ -1076,6 +1232,7 @@ for path in sorted(glob.glob(os.path.join(root, "*_agent.py"))):
                 except KeeperError:
                     current_version = None
                 if current_version == installed:
+                    self._adopt_installed_server(installed, current)
                     self._record_healthy_installed(
                         state, installed, "start_already_healthy"
                     )

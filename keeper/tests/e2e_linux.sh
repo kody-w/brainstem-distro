@@ -28,7 +28,18 @@ snapshot_tree() {
   local output=$2
   (
     cd "$root"
-    find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum
+    find . -type f \
+      ! -name '.brainstem_secret' \
+      ! -name '.copilot_pending' \
+      ! -name '.copilot_session' \
+      ! -name '.copilot_token' \
+      -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum
+    find . -type f \( \
+      -name '.brainstem_secret' -o \
+      -name '.copilot_pending' -o \
+      -name '.copilot_session' -o \
+      -name '.copilot_token' \
+      \) -printf 'PRIVATE %p mode=%m size=%s\n' | LC_ALL=C sort
     find . -type l -print0 | LC_ALL=C sort -z |
       while IFS= read -r -d '' link; do
         printf 'LINK %s -> %s\n' "$link" "$(readlink "$link")"
@@ -55,14 +66,54 @@ snapshot_without_keeper() {
   local output=$1
   (
     cd "$HOME/.brainstem"
-    find . -path './keeper' -prune -o -type f -print0 |
+    find . -path './keeper' -prune -o -type f \
+      ! -name '.brainstem_secret' \
+      ! -name '.copilot_pending' \
+      ! -name '.copilot_session' \
+      ! -name '.copilot_token' \
+      -print0 |
       LC_ALL=C sort -z | xargs -0 -r sha256sum
+    find . -path './keeper' -prune -o -type f \( \
+      -name '.brainstem_secret' -o \
+      -name '.copilot_pending' -o \
+      -name '.copilot_session' -o \
+      -name '.copilot_token' \
+      \) -printf 'PRIVATE %p mode=%m size=%s\n' | LC_ALL=C sort
     find . -path './keeper' -prune -o -type l -print0 |
       LC_ALL=C sort -z |
       while IFS= read -r -d '' link; do
         printf 'LINK %s -> %s\n' "$link" "$(readlink "$link")"
       done
   ) > "$output"
+}
+
+assert_signin_preserved() {
+  local step=$1
+  local token="$HOME/.brainstem/src/rapp_brainstem/.copilot_token"
+  test -f "$token"
+  test "$(stat -c '%a' "$token")" = "600"
+  cmp -s /tmp/original-copilot-token "$token"
+  echo "SIGNIN $step token present, mode 0600, byte-identical"
+}
+
+assert_installed_pid_adopted() {
+  local step=$1
+  python3 - "$KEEPER" "$step" <<'PY'
+import importlib.util
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+step = sys.argv[2]
+spec = importlib.util.spec_from_file_location("keeper_e2e_adoption", path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+keeper = module.Keeper()
+pid = keeper._read_pid(keeper.installed_pid_path)
+holders = keeper._port_pids()
+assert pid in holders, (pid, holders)
+print("ADOPTION {} installed.pid={} holds port 7071".format(step, pid))
+PY
 }
 
 observe_contract() {
@@ -130,8 +181,11 @@ printf '0.0.0.0 api.github.com\n' >> /etc/hosts
 TOKEN_VALUE="ghu_$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 mkdir -p "$HOME/.brainstem/src/rapp_brainstem"
 printf '%s\n' "$TOKEN_VALUE" > "$HOME/.brainstem/src/rapp_brainstem/.copilot_token"
+chmod 600 "$HOME/.brainstem/src/rapp_brainstem/.copilot_token"
+cp "$HOME/.brainstem/src/rapp_brainstem/.copilot_token" /tmp/original-copilot-token
+chmod 600 /tmp/original-copilot-token
 
-echo "STEP 1 official install brainstem-v0.6.15 without a persistent launch"
+echo "STEP 1 official install brainstem-v0.6.15 and adopt its healthy server"
 python3 - "$KEEPER" <<'PY'
 import importlib.util
 import sys
@@ -146,10 +200,11 @@ print("INSTALL_0_6_15 ok={} reason={}".format(ok, reason))
 if not ok:
     raise SystemExit(1)
 PY
-printf '%s\n' "$TOKEN_VALUE" > "$HOME/.brainstem/src/rapp_brainstem/.copilot_token"
+assert_signin_preserved "after step 1"
 snapshot_tracked_source /tmp/source-before-first-start.sha256
 python3 "$KEEPER" start
 observe_contract "0.6.15"
+assert_installed_pid_adopted "after step 1"
 show_state
 test -d "$HOME/.brainstem/keeper/safe/0.6.15"
 test -x "$HOME/.brainstem/keeper/safe-venv/bin/python"
@@ -160,7 +215,9 @@ echo "SOURCE_COMPARISON first keeper start left all tracked grail files unchange
 echo "STEP 2 upgrade to brainstem-v0.6.16"
 python3 "$KEEPER" upgrade --to 0.6.16
 observe_contract "0.6.16"
+assert_installed_pid_adopted "after step 2"
 show_state
+assert_signin_preserved "after step 2"
 
 echo "STEP 3 create local bad release brainstem-v0.6.99"
 git clone --mirror "$HOME/.brainstem/src" "$MIRROR" >/dev/null 2>&1
@@ -180,7 +237,9 @@ git config --global --add url."file://$MIRROR".insteadOf "https://github.com/kod
 
 python3 "$KEEPER" upgrade --to 0.6.99
 observe_contract "0.6.16"
+assert_installed_pid_adopted "after step 3 rollback"
 show_state
+assert_signin_preserved "after step 3"
 python3 - <<'PY'
 import json
 from pathlib import Path
@@ -201,7 +260,9 @@ git -C "$MIRROR_WORK" tag brainstem-v0.6.100
 git -C "$MIRROR_WORK" push -q origin HEAD:refs/heads/keeper-e2e-good brainstem-v0.6.100
 python3 "$KEEPER" upgrade --to 0.6.100
 observe_contract "0.6.100"
+assert_installed_pid_adopted "after step 4"
 show_state
+assert_signin_preserved "after step 4"
 
 echo "STEP 5 catastrophe falls back to safe copy"
 if [ -f "$HOME/.brainstem/keeper/installed.pid" ]; then
@@ -235,6 +296,7 @@ with urllib.request.urlopen("http://127.0.0.1:7071/health", timeout=10) as respo
     health = json.load(response)
 assert "/keeper/safe/0.6.100" in health["brainstem_dir"], health
 PY
+assert_signin_preserved "after step 5"
 
 echo "STEP 6 uninstall removes keeper and changes nothing else"
 snapshot_tree "$HOME/.brainstem/src" /tmp/source-before-uninstall.sha256
@@ -243,6 +305,7 @@ show_state
 python3 "$KEEPER" uninstall
 test ! -e "$HOME/.brainstem/keeper"
 test -d "$HOME/.brainstem/src/rapp_brainstem"
+assert_signin_preserved "after step 6"
 snapshot_tree "$HOME/.brainstem/src" /tmp/source-after-uninstall.sha256
 snapshot_without_keeper /tmp/brainstem-after-uninstall.sha256
 diff -u /tmp/source-before-uninstall.sha256 /tmp/source-after-uninstall.sha256
