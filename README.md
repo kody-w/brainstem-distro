@@ -6,11 +6,15 @@ A **distro** is the Brainstem kernel, unchanged and pinned to one commit, plus w
 
 Click **Use this template** to start one.
 
+> **Naming, for the people who use it:** "distro" is a builder's word. To the people who install yours, it is just
+> **Brainstem**, described by what it does ("Brainstem with free models", "Brainstem for your team"). Never put
+> "distro" in front of your users.
+
 ## What you get
 
 | Piece | What it does |
 |---|---|
-| `plugin/kernel.json` | The kernel commit you stand on, and the hash of its chat page. |
+| `plugin/kernel.json` | The kernel commit, version, kernel git blob, and chat-page git blob you stand on. |
 | `plugin/distro.json` | Your distro: its name, and what to run. |
 | `plugin/server.py` | The plugin. It starts your engine on a free local port and serves the kernel's chat page as an app window inside the AI tool. Standard library only, nothing to install. |
 | `plugin/bridge.js` | Lets the chat page talk to your engine from inside the app window. |
@@ -57,7 +61,7 @@ After that they ask their AI tool to "open <your distro>" and the chat window ap
 ## The rules
 
 1. **Never patch the kernel.** Your distro pins a commit and builds on top of it. If every user needs a change and it can't be done from outside, ask the kernel's owner.
-2. **Move the pin on purpose.** Update `sha` and `ui_blob` in `kernel.json`, then run the checks.
+2. **Move the pin on purpose.** Update `sha`, `version`, `kernel_blob` and `ui_blob` in `kernel.json`, then run the checks.
 3. **Keep the contract.** `POST /chat` answers in the field `response`. `agent_logs` is text, one line per agent. `GET /health` returns `status`, `version`, `model`, `agents` and `quarantined`.
 
 ## Distros built on this

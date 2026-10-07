@@ -804,7 +804,16 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] in ("--say", "--take-over", "--conversation", "--voices"):
         sys.exit(cli(sys.argv[1:]))
     if "--check" in sys.argv:
-        report = {"engine": engine(), "health": json.loads(call_engine("GET", "/health")[1]), "page_bytes": len(app_html().encode())}
+        report = {
+            "engine": engine(),
+            "health": json.loads(call_engine("GET", "/health")[1]),
+            "kernel": {
+                "sha": KERNEL["sha"],
+                "version": KERNEL["version"],
+                "blob": KERNEL["kernel_blob"],
+            },
+            "page_bytes": len(app_html().encode()),
+        }
         print(json.dumps(report, indent=2))
         if _engine["proc"]:
             _engine["proc"].terminate()
