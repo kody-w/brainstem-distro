@@ -18,6 +18,20 @@ keeper_module = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(keeper_module)
 
 
+def write_token(brainstem_dir, content):
+    brainstem_dir.mkdir(parents=True, exist_ok=True)
+    token_path = brainstem_dir / ".copilot_token"
+    token_path.write_bytes(content)
+    token_path.chmod(0o600)
+    return token_path
+
+
+def write_flight_log(brainstem_dir, events):
+    path = brainstem_dir / keeper_module.SIGNIN_FLIGHT_LOG
+    path.write_text(json.dumps(events), encoding="utf-8")
+    return path
+
+
 class ContractHandler(BaseHTTPRequestHandler):
     version = "0.6.16"
     health_status = "ok"
@@ -589,6 +603,355 @@ ThreadingHTTPServer(("127.0.0.1", int(os.environ["KEEPER_TEST_PORT"])), Handler)
             self.assertTrue(keeper.installed_kernel_path.is_file())
             self.assertIn("watch --interval 30", output.getvalue())
 
+    def test_signin_adopt_register_status_and_permissions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            brainstem_home = root / ".brainstem"
+            main = brainstem_home / "src" / "rapp_brainstem"
+            twin = root / "twin"
+            token_record = (
+                b'{"access_token":"credential-sentinel","saved_at":1}\n'
+            )
+            write_token(main, token_record)
+            twin.mkdir()
+            keeper = keeper_module.Keeper(
+                brainstem_home=brainstem_home,
+                now_func=lambda: 1000.0,
+            )
+
+            adopted = keeper.signin_adopt()
+            registered = keeper.signin_register(twin)
+            status = keeper.signin_status()
+
+            self.assertEqual(adopted["adopted_from"], "main")
+            self.assertEqual(adopted["generation"], 1)
+            self.assertEqual(registered["alias"], "brainstem-1")
+            self.assertEqual(
+                keeper.signin_holder_path.read_bytes(),
+                token_record,
+            )
+            self.assertEqual((twin / ".copilot_token").read_bytes(), token_record)
+            self.assertEqual(
+                keeper.signin_dir.stat().st_mode & 0o777,
+                0o700,
+            )
+            for path in (
+                keeper.signin_holder_path,
+                keeper.signin_generation_path,
+                keeper.signin_manifest_path,
+                main / ".copilot_token",
+                twin / ".copilot_token",
+            ):
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(
+                [item["alias"] for item in status["registered"]],
+                ["main", "brainstem-1"],
+            )
+            self.assertTrue(
+                all(item["matches_holder"] for item in status["registered"])
+            )
+            rendered = json.dumps(status, sort_keys=True)
+            self.assertNotIn("credential-sentinel", rendered)
+            self.assertNotIn(str(main), rendered)
+            self.assertNotIn(str(twin), rendered)
+
+    def test_signin_status_uses_generation_size_and_mtime_not_content(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            brainstem_home = root / ".brainstem"
+            main = brainstem_home / "src" / "rapp_brainstem"
+            twin = root / "twin"
+            original = b"same-length-record-a\n"
+            replacement = b"same-length-record-b\n"
+            self.assertEqual(len(original), len(replacement))
+            write_token(main, original)
+            twin.mkdir()
+            keeper = keeper_module.Keeper(
+                brainstem_home=brainstem_home,
+                now_func=lambda: 1000.0,
+            )
+            keeper.signin_adopt()
+            keeper.signin_register(twin)
+            generation = keeper._load_signin_generation(required=True)
+
+            twin_token = twin / ".copilot_token"
+            twin_token.write_bytes(replacement)
+            twin_token.chmod(0o600)
+            os.utime(
+                str(twin_token),
+                ns=(
+                    generation["token_mtime_ns"],
+                    generation["token_mtime_ns"],
+                ),
+            )
+
+            status = keeper.signin_status()
+            twin_status = next(
+                item
+                for item in status["registered"]
+                if item["alias"] == "brainstem-1"
+            )
+            self.assertTrue(twin_status["matches_holder"])
+            self.assertEqual(twin_status["generation"], 1)
+
+    def test_signin_sync_projects_holder_to_registered_brainstems(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            brainstem_home = root / ".brainstem"
+            main = brainstem_home / "src" / "rapp_brainstem"
+            twin = root / "twin"
+            holder_record = b"holder-record\n"
+            write_token(main, holder_record)
+            twin.mkdir()
+            keeper = keeper_module.Keeper(
+                brainstem_home=brainstem_home,
+                now_func=lambda: 1000.0,
+            )
+            keeper.signin_adopt()
+            keeper.signin_register(twin)
+            write_token(twin, b"drifted-data\n")
+
+            result = keeper.signin_sync()
+
+            self.assertIsNone(result["adopted_from"])
+            self.assertEqual(result["generation"], 1)
+            self.assertEqual((twin / ".copilot_token").read_bytes(), holder_record)
+            self.assertEqual(result["projected"], ["main", "brainstem-1"])
+
+    def test_signin_sync_adopts_newer_successful_login_and_projects_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            brainstem_home = root / ".brainstem"
+            main = brainstem_home / "src" / "rapp_brainstem"
+            twin_one = root / "twin-one"
+            twin_two = root / "twin-two"
+            original = b"original-record\n"
+            newer = b"newer-record\n"
+            write_token(main, original)
+            twin_one.mkdir()
+            twin_two.mkdir()
+            clock = [1000.0]
+            keeper = keeper_module.Keeper(
+                brainstem_home=brainstem_home,
+                now_func=lambda: clock[0],
+            )
+            keeper.signin_adopt()
+            keeper.signin_register(twin_one)
+            keeper.signin_register(twin_two)
+
+            write_token(twin_two, newer)
+            write_flight_log(
+                twin_two,
+                [
+                    {
+                        "ts": keeper._format_timestamp(1001.0),
+                        "type": "login.authorized",
+                        "level": "info",
+                        "data": {"token_prefix": "not-reported"},
+                    },
+                    {
+                        "ts": keeper._format_timestamp(1001.1),
+                        "type": "auth.token_saved",
+                        "level": "info",
+                    },
+                    {
+                        "ts": keeper._format_timestamp(1001.2),
+                        "type": "auth.copilot_ready",
+                        "level": "info",
+                    },
+                ],
+            )
+            status_before = keeper.signin_status()
+            twin_two_status = next(
+                item
+                for item in status_before["registered"]
+                if item["alias"] == "brainstem-2"
+            )
+            self.assertTrue(twin_two_status["drift"])
+            self.assertEqual(twin_two_status["exchange_state"], "ok")
+
+            clock[0] = 1002.0
+            result = keeper.signin_sync()
+
+            self.assertEqual(result["adopted_from"], "brainstem-2")
+            self.assertEqual(result["generation"], 2)
+            for brainstem_dir in (main, twin_one, twin_two):
+                self.assertEqual(
+                    (brainstem_dir / ".copilot_token").read_bytes(),
+                    newer,
+                )
+            status_after = keeper.signin_status()
+            self.assertFalse(
+                any(item["drift"] for item in status_after["registered"])
+            )
+
+    def test_signin_sync_rejects_newer_login_when_exchange_is_failing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            brainstem_home = root / ".brainstem"
+            main = brainstem_home / "src" / "rapp_brainstem"
+            twin = root / "twin"
+            original = b"working-record\n"
+            write_token(main, original)
+            twin.mkdir()
+            keeper = keeper_module.Keeper(
+                brainstem_home=brainstem_home,
+                now_func=lambda: 1000.0,
+            )
+            keeper.signin_adopt()
+            keeper.signin_register(twin)
+            write_token(twin, b"rejected-record\n")
+            write_flight_log(
+                twin,
+                [
+                    {
+                        "ts": keeper._format_timestamp(1001.0),
+                        "type": "login.authorized",
+                        "level": "info",
+                    },
+                    {
+                        "ts": keeper._format_timestamp(1001.1),
+                        "type": "auth.copilot_exchange_error",
+                        "level": "error",
+                        "data": {"status": 401},
+                    },
+                ],
+            )
+
+            result = keeper.signin_sync()
+
+            self.assertIsNone(result["adopted_from"])
+            self.assertEqual(result["generation"], 1)
+            self.assertEqual((twin / ".copilot_token").read_bytes(), original)
+            self.assertEqual(
+                keeper.signin_holder_path.read_bytes(),
+                original,
+            )
+
+    def test_signin_unregister_leaves_token_file_in_place(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            brainstem_home = root / ".brainstem"
+            main = brainstem_home / "src" / "rapp_brainstem"
+            twin = root / "twin"
+            token_record = b"retained-record\n"
+            write_token(main, token_record)
+            twin.mkdir()
+            keeper = keeper_module.Keeper(
+                brainstem_home=brainstem_home,
+                now_func=lambda: 1000.0,
+            )
+            keeper.signin_adopt()
+            keeper.signin_register(twin)
+
+            result = keeper.signin_unregister(twin)
+
+            self.assertFalse(result["registered"])
+            self.assertFalse(result["token_removed"])
+            self.assertIn("left in place", result["message"])
+            self.assertEqual((twin / ".copilot_token").read_bytes(), token_record)
+            self.assertEqual(
+                [item["alias"] for item in keeper.signin_status()["registered"]],
+                ["main"],
+            )
+
+    def test_signin_cli_never_prints_or_logs_credential_text_or_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            brainstem_home = root / ".brainstem"
+            main = brainstem_home / "src" / "rapp_brainstem"
+            twin = root / "twin"
+            sentinel = "KEEPER_CREDENTIAL_SENTINEL_DO_NOT_REPORT"
+            write_token(
+                main,
+                json.dumps(
+                    {
+                        "access_token": sentinel,
+                        "saved_at": 1,
+                    }
+                ).encode("utf-8"),
+            )
+            twin.mkdir()
+            write_flight_log(
+                main,
+                [
+                    {
+                        "ts": "2020-01-01T00:00:00Z",
+                        "type": "login.authorized",
+                        "data": {"token_prefix": sentinel},
+                    }
+                ],
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            commands = (
+                ["signin", "adopt"],
+                ["signin", "register", str(twin)],
+                ["signin", "status"],
+                ["signin", "sync"],
+                ["signin", "unregister", str(twin)],
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"BRAINSTEM_HOME": str(brainstem_home)},
+            ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
+                stderr
+            ):
+                for command in commands:
+                    self.assertEqual(keeper_module.main(command), 0)
+
+            keeper = keeper_module.Keeper(brainstem_home=brainstem_home)
+            log_text = (
+                keeper.log_path.read_text(encoding="utf-8")
+                if keeper.log_path.exists()
+                else ""
+            )
+            all_reports = stdout.getvalue() + stderr.getvalue() + log_text
+            self.assertNotIn(sentinel, all_reports)
+            self.assertNotIn(str(main), all_reports)
+            self.assertNotIn(str(twin), all_reports)
+
+    def test_watch_syncs_signin_before_start_each_cycle(self):
+        class WatchKeeper(keeper_module.Keeper):
+            def __init__(self, root):
+                super().__init__(
+                    brainstem_home=Path(root) / ".brainstem",
+                    now_func=lambda: 10.0,
+                    sleep_func=self.stop_after_cycle,
+                )
+                self.calls = []
+
+            def stop_after_cycle(self, _interval):
+                raise StopIteration()
+
+            def _write_log(self, _message, display=True):
+                return
+
+            def _signin_holder_present(self):
+                return True
+
+            def signin_sync(self):
+                self.calls.append("sync")
+                return {
+                    "generation": 1,
+                    "adopted_from": None,
+                    "warnings": [],
+                }
+
+            def start(self):
+                self.calls.append("start")
+
+            def load_state(self):
+                state = self._default_state()
+                state["last_upgrade_check"] = 10.0
+                return state
+
+        with tempfile.TemporaryDirectory() as temporary:
+            keeper = WatchKeeper(temporary)
+            with self.assertRaises(StopIteration):
+                keeper.watch(1)
+            self.assertEqual(keeper.calls, ["sync", "start"])
+
     def test_uninstall_removes_only_keeper_tree(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -596,16 +959,23 @@ ThreadingHTTPServer(("127.0.0.1", int(os.environ["KEEPER_TEST_PORT"])), Handler)
             grail_file = keeper.kernel_dir / "brainstem.py"
             grail_file.parent.mkdir(parents=True)
             grail_file.write_text("unchanged\n", encoding="utf-8")
-            keeper.keeper_home.mkdir(parents=True)
-            (keeper.keeper_home / "state.json").write_text(
-                "{}\n", encoding="utf-8"
-            )
+            write_token(keeper.kernel_dir, b"main-record\n")
+            twin = root / "twin"
+            twin.mkdir()
+            keeper.signin_adopt()
+            keeper.signin_register(twin)
+            twin_token = twin / ".copilot_token"
             with contextlib.redirect_stdout(io.StringIO()):
                 keeper.uninstall()
             self.assertFalse(keeper.keeper_home.exists())
             self.assertEqual(
                 grail_file.read_text(encoding="utf-8"), "unchanged\n"
             )
+            self.assertEqual(
+                (keeper.kernel_dir / ".copilot_token").read_bytes(),
+                b"main-record\n",
+            )
+            self.assertEqual(twin_token.read_bytes(), b"main-record\n")
 
 
 if __name__ == "__main__":

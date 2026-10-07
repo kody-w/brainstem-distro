@@ -7,6 +7,7 @@ import datetime
 import errno
 import hashlib
 import json
+import math
 import os
 import plistlib
 import re
@@ -14,6 +15,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -31,6 +33,23 @@ UPGRADE_INTERVAL = 24 * 60 * 60
 HISTORY_LIMIT = 20
 SERVICE_LABEL = "io.rapp.keeper"
 SYSTEMD_SERVICE = "rapp-keeper.service"
+SIGNIN_MANIFEST_VERSION = 1
+SIGNIN_FLIGHT_LOG = ".brainstem_book.json"
+SIGNIN_SUCCESS_EVENTS = (
+    "auth.copilot_ready",
+    "auth.copilot_restored",
+    "auth.retry_ok",
+)
+SIGNIN_FAILURE_EVENTS = (
+    "auth.copilot_exchange_failed",
+    "auth.copilot_exchange_error",
+    "auth.copilot_no_token",
+    "auth.no_copilot_access",
+)
+SIGNIN_GENERATION_EVENTS = (
+    "login.authorized",
+    "auth.token_saved",
+)
 SIGNIN_CARRY_NAMES = (
     ".brainstem_secret",
     ".copilot_pending",
@@ -98,6 +117,10 @@ class Keeper:
         self.launcher = Path.home() / ".local" / "bin" / "brainstem"
         self.keeper_home = self.brainstem_home / "keeper"
         self.carry_dir = self.keeper_home / "carry"
+        self.signin_dir = self.keeper_home / "signin"
+        self.signin_holder_path = self.signin_dir / ".copilot_token"
+        self.signin_generation_path = self.signin_dir / "generation.json"
+        self.signin_manifest_path = self.signin_dir / "manifest.json"
         self.safe_root = self.keeper_home / "safe"
         self.safe_venv = self.keeper_home / "safe-venv"
         self.state_path = self.keeper_home / "state.json"
@@ -133,11 +156,60 @@ class Keeper:
         except OSError:
             pass
 
-    def _timestamp(self):
+    def _ensure_signin_dir(self):
+        try:
+            self._ensure_keeper_home()
+            if os.path.lexists(str(self.signin_dir)) and (
+                self.signin_dir.is_symlink()
+                or not self.signin_dir.is_dir()
+            ):
+                raise KeeperError("The shared sign-in directory is invalid.")
+            self.signin_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.signin_dir.chmod(0o700)
+        except OSError:
+            raise KeeperError("Cannot create the shared sign-in directory.")
+
+    def _secure_existing_signin_dir(self):
+        if not os.path.lexists(str(self.signin_dir)):
+            return
+        if self.signin_dir.is_symlink() or not self.signin_dir.is_dir():
+            raise KeeperError("The shared sign-in directory is invalid.")
+        try:
+            self.signin_dir.chmod(0o700)
+        except OSError:
+            raise KeeperError("Cannot secure the shared sign-in directory.")
+
+    def _format_timestamp(self, epoch):
         value = datetime.datetime.fromtimestamp(
-            self.now(), datetime.timezone.utc
+            float(epoch), datetime.timezone.utc
         ).isoformat()
         return value.replace("+00:00", "Z")
+
+    def _timestamp(self):
+        return self._format_timestamp(self.now())
+
+    def _parse_timestamp(self, value):
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed.timestamp()
 
     def _default_state(self):
         return {
@@ -208,7 +280,49 @@ class Keeper:
         if display:
             print(str(message), flush=True)
 
-    def _copy_private_file(self, source, destination):
+    def _fsync_directory(self, directory):
+        descriptor = os.open(str(directory), os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _atomic_write_private_json(self, destination, payload):
+        temporary = destination.with_name(
+            ".{}.tmp-{}-{}".format(
+                destination.name.lstrip("."),
+                os.getpid(),
+                time.time_ns(),
+            )
+        )
+        handle = None
+        try:
+            fd = os.open(
+                str(temporary),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            handle = os.fdopen(fd, "w", encoding="utf-8")
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.close()
+            handle = None
+            os.chmod(str(temporary), 0o600)
+            os.replace(str(temporary), str(destination))
+            self._fsync_directory(destination.parent)
+        except OSError:
+            raise KeeperError("Cannot write shared sign-in metadata.")
+        finally:
+            if handle is not None:
+                handle.close()
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _copy_private_file(self, source, destination, mtime_ns=None):
         temporary = destination.with_name(
             ".{}.tmp-{}-{}".format(
                 destination.name.lstrip("."),
@@ -232,7 +346,13 @@ class Keeper:
             destination_handle.close()
             destination_handle = None
             os.chmod(str(temporary), 0o600)
+            if mtime_ns is not None:
+                os.utime(
+                    str(temporary),
+                    ns=(int(mtime_ns), int(mtime_ns)),
+                )
             os.replace(str(temporary), str(destination))
+            self._fsync_directory(destination.parent)
         finally:
             if source_handle is not None:
                 source_handle.close()
@@ -302,6 +422,635 @@ class Keeper:
         stop_event.set()
         guard_thread.join(timeout=2)
         return self._restore_carried_signin_files(remove_restored=True)
+
+    def _default_signin_manifest(self):
+        return {
+            "version": SIGNIN_MANIFEST_VERSION,
+            "brainstems": [],
+        }
+
+    def _load_signin_manifest(self):
+        self._secure_existing_signin_dir()
+        if not self.signin_manifest_path.exists():
+            return self._default_signin_manifest()
+        if self.signin_manifest_path.is_symlink():
+            raise KeeperError("The shared sign-in manifest is invalid.")
+        try:
+            with self.signin_manifest_path.open(
+                "r", encoding="utf-8"
+            ) as handle:
+                manifest = json.load(handle)
+        except (OSError, ValueError):
+            raise KeeperError("Cannot read the shared sign-in manifest.")
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("version") != SIGNIN_MANIFEST_VERSION
+            or not isinstance(manifest.get("brainstems"), list)
+        ):
+            raise KeeperError("The shared sign-in manifest is invalid.")
+        aliases = set()
+        paths = set()
+        for entry in manifest["brainstems"]:
+            if (
+                not isinstance(entry, dict)
+                or not isinstance(entry.get("alias"), str)
+                or not entry["alias"]
+                or not isinstance(entry.get("path"), str)
+                or not Path(entry["path"]).is_absolute()
+            ):
+                raise KeeperError("The shared sign-in manifest is invalid.")
+            if entry["alias"] in aliases or entry["path"] in paths:
+                raise KeeperError("The shared sign-in manifest is invalid.")
+            aliases.add(entry["alias"])
+            paths.add(entry["path"])
+        try:
+            self.signin_manifest_path.chmod(0o600)
+        except OSError:
+            raise KeeperError("Cannot secure the shared sign-in manifest.")
+        return manifest
+
+    def _save_signin_manifest(self, manifest):
+        self._ensure_signin_dir()
+        self._atomic_write_private_json(self.signin_manifest_path, manifest)
+
+    def _canonical_brainstem_dir(self, value, must_exist=True):
+        try:
+            path = Path(value).expanduser().resolve(strict=must_exist)
+        except (OSError, RuntimeError):
+            raise KeeperError("The Brainstem directory is unavailable.")
+        if must_exist and not path.is_dir():
+            raise KeeperError("The Brainstem directory is unavailable.")
+        return path
+
+    def _main_brainstem_dir(self):
+        return self.kernel_dir.expanduser().resolve(strict=False)
+
+    def _manifest_entry_for_path(self, manifest, brainstem_dir):
+        text = str(brainstem_dir)
+        for entry in manifest["brainstems"]:
+            if entry["path"] == text:
+                return entry
+        return None
+
+    def _next_brainstem_alias(self, manifest, brainstem_dir):
+        used = {entry["alias"] for entry in manifest["brainstems"]}
+        if brainstem_dir == self._main_brainstem_dir() and "main" not in used:
+            return "main"
+        index = 1
+        while "brainstem-{}".format(index) in used:
+            index += 1
+        return "brainstem-{}".format(index)
+
+    def _ensure_manifest_entry(self, manifest, brainstem_dir):
+        existing = self._manifest_entry_for_path(manifest, brainstem_dir)
+        if existing is not None:
+            return existing, False
+        entry = {
+            "alias": self._next_brainstem_alias(manifest, brainstem_dir),
+            "path": str(brainstem_dir),
+        }
+        manifest["brainstems"].append(entry)
+        return entry, True
+
+    def _signin_entry_sort_key(self, entry):
+        alias = entry["alias"]
+        if alias == "main":
+            return (0, 0)
+        match = re.fullmatch(r"brainstem-(\d+)", alias)
+        if match:
+            return (1, int(match.group(1)))
+        return (2, alias)
+
+    def _load_signin_generation(self, required=False):
+        self._secure_existing_signin_dir()
+        token_exists = self.signin_holder_path.exists()
+        generation_exists = self.signin_generation_path.exists()
+        if not token_exists and not generation_exists:
+            if required:
+                raise KeeperError(
+                    "No shared sign-in holder exists; run signin adopt first."
+                )
+            return None
+        if not token_exists or not generation_exists:
+            raise KeeperError("The shared sign-in holder is incomplete.")
+        if (
+            self.signin_holder_path.is_symlink()
+            or self.signin_generation_path.is_symlink()
+        ):
+            raise KeeperError("The shared sign-in holder is invalid.")
+        try:
+            with self.signin_generation_path.open(
+                "r", encoding="utf-8"
+            ) as handle:
+                generation = json.load(handle)
+            holder_stat = self.signin_holder_path.stat()
+        except (OSError, ValueError):
+            raise KeeperError("Cannot read the shared sign-in holder.")
+        parsed_generated_at = self._parse_timestamp(
+            generation.get("generated_at_iso")
+            if isinstance(generation, dict)
+            else None
+        )
+        required_fields = {
+            "version",
+            "generation",
+            "generated_at",
+            "generated_at_iso",
+            "source_alias",
+            "token_size",
+            "token_mtime_ns",
+        }
+        if (
+            not isinstance(generation, dict)
+            or set(generation) != required_fields
+            or generation.get("version") != SIGNIN_MANIFEST_VERSION
+            or isinstance(generation.get("generation"), bool)
+            or not isinstance(generation.get("generation"), int)
+            or generation["generation"] < 1
+            or isinstance(generation.get("generated_at"), bool)
+            or not isinstance(generation.get("generated_at"), (int, float))
+            or not isinstance(generation.get("generated_at_iso"), str)
+            or parsed_generated_at is None
+            or abs(
+                parsed_generated_at - float(generation["generated_at"])
+            ) > 0.000001
+            or not isinstance(generation.get("source_alias"), str)
+            or not generation["source_alias"]
+            or isinstance(generation.get("token_size"), bool)
+            or not isinstance(generation.get("token_size"), int)
+            or generation["token_size"] < 1
+            or isinstance(generation.get("token_mtime_ns"), bool)
+            or not isinstance(generation.get("token_mtime_ns"), int)
+            or generation["token_mtime_ns"] < 1
+            or not stat.S_ISREG(holder_stat.st_mode)
+        ):
+            raise KeeperError("The shared sign-in generation is invalid.")
+        if (
+            holder_stat.st_size != generation["token_size"]
+            or holder_stat.st_mtime_ns != generation["token_mtime_ns"]
+        ):
+            raise KeeperError("The shared sign-in holder does not match its generation.")
+        try:
+            self.signin_holder_path.chmod(0o600)
+            self.signin_generation_path.chmod(0o600)
+        except OSError:
+            raise KeeperError("Cannot secure the shared sign-in holder.")
+        return generation
+
+    def _write_signin_generation(
+        self,
+        source_token,
+        source_alias,
+        event_time=None,
+    ):
+        previous = self._load_signin_generation(required=False)
+        if source_token == self.signin_holder_path:
+            raise KeeperError("The holder cannot adopt itself.")
+        try:
+            source_lstat = os.lstat(str(source_token))
+        except OSError:
+            raise KeeperError(
+                "The source Brainstem has no token record to adopt."
+            )
+        if (
+            not stat.S_ISREG(source_lstat.st_mode)
+            or source_lstat.st_size < 1
+        ):
+            raise KeeperError("The source Brainstem token record is invalid.")
+
+        generation_number = (
+            previous["generation"] + 1 if previous is not None else 1
+        )
+        previous_mtime_ns = (
+            previous["token_mtime_ns"] if previous is not None else 0
+        )
+        generation_time = max(
+            float(self.now()),
+            float(event_time) if event_time is not None else 0.0,
+        )
+        generation_seconds = max(
+            int(math.ceil(generation_time)),
+            (previous_mtime_ns // 1000000000) + 1,
+            1,
+        )
+        generation_mtime_ns = generation_seconds * 1000000000
+        generation_time = generation_mtime_ns / 1000000000.0
+        self._ensure_signin_dir()
+
+        stable = False
+        for _attempt in range(3):
+            try:
+                before = os.lstat(str(source_token))
+            except OSError:
+                break
+            if not stat.S_ISREG(before.st_mode) or before.st_size < 1:
+                break
+            try:
+                self._copy_private_file(
+                    source_token,
+                    self.signin_holder_path,
+                    mtime_ns=generation_mtime_ns,
+                )
+            except OSError:
+                raise KeeperError(
+                    "Cannot write the shared sign-in holder."
+                )
+            try:
+                after = os.lstat(str(source_token))
+            except OSError:
+                continue
+            before_identity = (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+            )
+            after_identity = (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            )
+            if before_identity == after_identity:
+                stable = True
+                break
+        if not stable:
+            raise KeeperError(
+                "The source Brainstem token changed while it was being adopted."
+            )
+
+        try:
+            holder_stat = self.signin_holder_path.stat()
+        except OSError:
+            raise KeeperError("Cannot read the shared sign-in holder.")
+        generation = {
+            "version": SIGNIN_MANIFEST_VERSION,
+            "generation": generation_number,
+            "generated_at": generation_time,
+            "generated_at_iso": self._format_timestamp(generation_time),
+            "source_alias": source_alias,
+            "token_size": holder_stat.st_size,
+            "token_mtime_ns": holder_stat.st_mtime_ns,
+        }
+        self._atomic_write_private_json(
+            self.signin_generation_path,
+            generation,
+        )
+        return generation
+
+    def _project_signin_entry(self, entry, generation):
+        brainstem_dir = Path(entry["path"])
+        if not brainstem_dir.is_dir():
+            raise KeeperError("Registered Brainstem is unavailable.")
+        destination = brainstem_dir / ".copilot_token"
+        try:
+            self._copy_private_file(
+                self.signin_holder_path,
+                destination,
+                mtime_ns=generation["token_mtime_ns"],
+            )
+            projected = destination.stat()
+        except OSError:
+            raise KeeperError("Registered Brainstem could not be updated.")
+        if (
+            projected.st_size != generation["token_size"]
+            or projected.st_mtime_ns != generation["token_mtime_ns"]
+            or stat.S_IMODE(projected.st_mode) != 0o600
+        ):
+            raise KeeperError("Projected token metadata is invalid.")
+
+    def _project_signin_manifest(self, manifest, generation, entries=None):
+        selected = list(entries or manifest["brainstems"])
+        projected = []
+        failures = []
+        for entry in sorted(selected, key=self._signin_entry_sort_key):
+            try:
+                self._project_signin_entry(entry, generation)
+            except (KeeperError, OSError):
+                failures.append(entry["alias"])
+            else:
+                projected.append(entry["alias"])
+        if failures:
+            raise KeeperError(
+                "Shared sign-in generation {} could not reach: {}.".format(
+                    generation["generation"],
+                    ", ".join(failures),
+                )
+            )
+        return projected
+
+    def _flight_signin_state(self, brainstem_dir, holder_time):
+        state = {
+            "log_state": "missing",
+            "newer_login_authorized_at": None,
+            "newer_signin_at": None,
+            "candidate_at": None,
+            "exchange_state": "unknown",
+            "error": False,
+        }
+        flight_path = brainstem_dir / SIGNIN_FLIGHT_LOG
+        if not flight_path.exists():
+            return state
+        try:
+            with flight_path.open("r", encoding="utf-8") as handle:
+                events = json.load(handle)
+        except (OSError, ValueError):
+            state["log_state"] = "invalid"
+            state["error"] = True
+            return state
+        if not isinstance(events, list):
+            state["log_state"] = "invalid"
+            state["error"] = True
+            return state
+        state["log_state"] = "ok"
+
+        latest_authorized = None
+        latest_signin = None
+        malformed_relevant_event = False
+        for index, event in enumerate(events):
+            if not isinstance(event, dict):
+                continue
+            event_type = event.get("type")
+            if event_type not in (
+                SIGNIN_GENERATION_EVENTS
+                + SIGNIN_SUCCESS_EVENTS
+                + SIGNIN_FAILURE_EVENTS
+            ):
+                continue
+            event_time = self._parse_timestamp(event.get("ts"))
+            if event_time is None:
+                malformed_relevant_event = True
+                continue
+            if event_type == "login.authorized":
+                if latest_authorized is None or event_time > latest_authorized:
+                    latest_authorized = event_time
+            if event_type in SIGNIN_GENERATION_EVENTS:
+                candidate = (event_time, index, event_type)
+                if latest_signin is None or candidate[:2] > latest_signin[:2]:
+                    latest_signin = candidate
+
+        if malformed_relevant_event:
+            state["log_state"] = "invalid"
+            state["error"] = True
+        if latest_authorized is not None and (
+            holder_time is not None and latest_authorized > holder_time
+        ):
+            state["newer_login_authorized_at"] = self._format_timestamp(
+                latest_authorized
+            )
+        if latest_signin is None:
+            return state
+
+        signin_time, signin_index, _event_type = latest_signin
+        exchange_state = "unknown"
+        for event in events[signin_index + 1:]:
+            if not isinstance(event, dict):
+                continue
+            event_type = event.get("type")
+            if event_type in SIGNIN_SUCCESS_EVENTS:
+                exchange_state = "ok"
+            elif event_type in SIGNIN_FAILURE_EVENTS:
+                exchange_state = "failing"
+        state["exchange_state"] = exchange_state
+        if holder_time is not None and signin_time > holder_time:
+            state["newer_signin_at"] = self._format_timestamp(signin_time)
+            if exchange_state != "failing" and not state["error"]:
+                state["candidate_at"] = signin_time
+        return state
+
+    def _signin_token_status(self, brainstem_dir, generation):
+        token_path = brainstem_dir / ".copilot_token"
+        try:
+            token_stat = os.lstat(str(token_path))
+        except FileNotFoundError:
+            return {
+                "state": "missing",
+                "matches_holder": False,
+                "modified_at": None,
+            }
+        except OSError:
+            return {
+                "state": "unavailable",
+                "matches_holder": False,
+                "modified_at": None,
+            }
+        if not stat.S_ISREG(token_stat.st_mode):
+            return {
+                "state": "invalid",
+                "matches_holder": False,
+                "modified_at": None,
+            }
+        matches = bool(
+            generation is not None
+            and token_stat.st_size == generation["token_size"]
+            and token_stat.st_mtime_ns == generation["token_mtime_ns"]
+        )
+        return {
+            "state": "current" if matches else "different",
+            "matches_holder": matches,
+            "modified_at": self._format_timestamp(token_stat.st_mtime),
+        }
+
+    def signin_status(self):
+        with self.lock():
+            manifest = self._load_signin_manifest()
+            holder_error = None
+            try:
+                generation = self._load_signin_generation(required=False)
+            except KeeperError as exc:
+                generation = None
+                holder_error = str(exc)
+            if generation is None:
+                holder = {
+                    "state": "invalid" if holder_error else "absent",
+                    "generation": None,
+                    "generated_at": None,
+                    "source": None,
+                }
+                if holder_error:
+                    holder["error"] = holder_error
+                holder_time = None
+            else:
+                holder = {
+                    "state": "ready",
+                    "generation": generation["generation"],
+                    "generated_at": generation["generated_at_iso"],
+                    "source": generation["source_alias"],
+                }
+                holder_time = generation["generated_at"]
+
+            brainstems = []
+            for entry in sorted(
+                manifest["brainstems"], key=self._signin_entry_sort_key
+            ):
+                brainstem_dir = Path(entry["path"])
+                token = self._signin_token_status(brainstem_dir, generation)
+                flight = self._flight_signin_state(
+                    brainstem_dir,
+                    holder_time,
+                )
+                brainstems.append(
+                    {
+                        "alias": entry["alias"],
+                        "token_state": token["state"],
+                        "matches_holder": token["matches_holder"],
+                        "generation": (
+                            generation["generation"]
+                            if token["matches_holder"]
+                            else None
+                        ),
+                        "token_modified_at": token["modified_at"],
+                        "flight_log": flight["log_state"],
+                        "newer_login_authorized_at": (
+                            flight["newer_login_authorized_at"]
+                        ),
+                        "newer_signin_at": flight["newer_signin_at"],
+                        "exchange_state": flight["exchange_state"],
+                        "drift": bool(
+                            flight["newer_login_authorized_at"]
+                        ),
+                    }
+                )
+            return {
+                "holder": holder,
+                "registered": brainstems,
+            }
+
+    def signin_adopt(self, source=None):
+        with self.lock():
+            brainstem_dir = self._canonical_brainstem_dir(
+                source or self.kernel_dir
+            )
+            manifest = self._load_signin_manifest()
+            entry, _added = self._ensure_manifest_entry(
+                manifest,
+                brainstem_dir,
+            )
+            generation = self._write_signin_generation(
+                brainstem_dir / ".copilot_token",
+                entry["alias"],
+            )
+            self._save_signin_manifest(manifest)
+            projected = self._project_signin_manifest(
+                manifest,
+                generation,
+            )
+            return {
+                "adopted_from": entry["alias"],
+                "generation": generation["generation"],
+                "generated_at": generation["generated_at_iso"],
+                "projected": projected,
+            }
+
+    def signin_register(self, value):
+        with self.lock():
+            generation = self._load_signin_generation(required=True)
+            brainstem_dir = self._canonical_brainstem_dir(value)
+            manifest = self._load_signin_manifest()
+            entry, added = self._ensure_manifest_entry(
+                manifest,
+                brainstem_dir,
+            )
+            self._project_signin_entry(entry, generation)
+            if added:
+                self._save_signin_manifest(manifest)
+            return {
+                "alias": entry["alias"],
+                "generation": generation["generation"],
+                "projected": True,
+            }
+
+    def signin_unregister(self, value):
+        with self.lock():
+            brainstem_dir = self._canonical_brainstem_dir(
+                value,
+                must_exist=False,
+            )
+            manifest = self._load_signin_manifest()
+            entry = self._manifest_entry_for_path(
+                manifest,
+                brainstem_dir,
+            )
+            if entry is None:
+                raise KeeperError("That Brainstem is not registered.")
+            manifest["brainstems"] = [
+                item
+                for item in manifest["brainstems"]
+                if item["path"] != entry["path"]
+            ]
+            self._save_signin_manifest(manifest)
+            return {
+                "alias": entry["alias"],
+                "registered": False,
+                "token_removed": False,
+                "message": "Token file was left in place.",
+            }
+
+    def signin_sync(self):
+        with self.lock():
+            generation = self._load_signin_generation(required=True)
+            manifest = self._load_signin_manifest()
+            candidates = []
+            warnings = []
+            for entry in manifest["brainstems"]:
+                brainstem_dir = Path(entry["path"])
+                flight = self._flight_signin_state(
+                    brainstem_dir,
+                    generation["generated_at"],
+                )
+                if flight["error"]:
+                    warnings.append(entry["alias"])
+                if flight["candidate_at"] is None:
+                    continue
+                token_path = brainstem_dir / ".copilot_token"
+                try:
+                    token_stat = os.lstat(str(token_path))
+                except OSError:
+                    warnings.append(entry["alias"])
+                    continue
+                if (
+                    not stat.S_ISREG(token_stat.st_mode)
+                    or token_stat.st_size < 1
+                ):
+                    warnings.append(entry["alias"])
+                    continue
+                candidates.append(
+                    (
+                        flight["candidate_at"],
+                        entry["alias"],
+                        token_path,
+                    )
+                )
+
+            adopted_from = None
+            if candidates:
+                candidate_time, adopted_from, source_token = max(
+                    candidates,
+                    key=lambda item: (item[0], item[1]),
+                )
+                generation = self._write_signin_generation(
+                    source_token,
+                    adopted_from,
+                    event_time=candidate_time,
+                )
+
+            projected = self._project_signin_manifest(
+                manifest,
+                generation,
+            )
+            return {
+                "generation": generation["generation"],
+                "generated_at": generation["generated_at_iso"],
+                "adopted_from": adopted_from,
+                "projected": projected,
+                "warnings": sorted(set(warnings)),
+            }
+
+    def _signin_holder_present(self):
+        return (
+            self.signin_holder_path.exists()
+            or self.signin_generation_path.exists()
+        )
 
     @contextlib.contextmanager
     def lock(self):
@@ -1488,6 +2237,27 @@ for path in sorted(glob.glob(os.path.join(root, "*_agent.py"))):
             "Keeper watch started with interval {} seconds.".format(interval)
         )
         while True:
+            if self._signin_holder_present():
+                try:
+                    signin_result = self.signin_sync()
+                except KeeperError as exc:
+                    self._write_log(
+                        "Watch sign-in sync failed: {}".format(exc)
+                    )
+                else:
+                    if signin_result["adopted_from"]:
+                        self._write_log(
+                            "Shared sign-in generation {} adopted from {}.".format(
+                                signin_result["generation"],
+                                signin_result["adopted_from"],
+                            )
+                        )
+                    if signin_result["warnings"]:
+                        self._write_log(
+                            "Shared sign-in flight log warnings: {}.".format(
+                                ", ".join(signin_result["warnings"])
+                            )
+                        )
             try:
                 self.start()
             except KeeperError as exc:
@@ -1664,7 +2434,10 @@ for path in sorted(glob.glob(os.path.join(root, "*_agent.py"))):
             self.uninstall_service()
         if self.keeper_home.exists():
             shutil.rmtree(str(self.keeper_home))
-        print("Keeper files removed. The grail install was not changed.")
+        print(
+            "Keeper files removed. Brainstem installs and their token files "
+            "were not changed."
+        )
 
 
 def print_json(value):
@@ -1688,6 +2461,41 @@ def build_parser():
     watch = subparsers.add_parser("watch", help="keep Brainstem healthy")
     watch.add_argument(
         "--interval", type=float, default=DEFAULT_INTERVAL, help="seconds"
+    )
+    signin = subparsers.add_parser(
+        "signin",
+        help="share one GitHub sign-in across registered Brainstems",
+    )
+    signin_subparsers = signin.add_subparsers(
+        dest="signin_command",
+        required=True,
+    )
+    signin_subparsers.add_parser(
+        "status",
+        help="show holder and registered Brainstem generations",
+    )
+    adopt = signin_subparsers.add_parser(
+        "adopt",
+        help="adopt an existing Brainstem token as the machine holder",
+    )
+    adopt.add_argument(
+        "--from",
+        dest="source",
+        help="Brainstem directory (defaults to the main install)",
+    )
+    register = signin_subparsers.add_parser(
+        "register",
+        help="register a Brainstem and project the holder into it",
+    )
+    register.add_argument("brainstem_dir")
+    unregister = signin_subparsers.add_parser(
+        "unregister",
+        help="remove a Brainstem from the manifest without deleting its token",
+    )
+    unregister.add_argument("brainstem_dir")
+    signin_subparsers.add_parser(
+        "sync",
+        help="adopt a newer successful sign-in and project the holder",
     )
     subparsers.add_parser(
         "install-service", help="install the per-user keeper service"
@@ -1716,6 +2524,17 @@ def main(argv=None):
             print_json(keeper.status())
         elif args.command == "watch":
             keeper.watch(args.interval)
+        elif args.command == "signin":
+            if args.signin_command == "status":
+                print_json(keeper.signin_status())
+            elif args.signin_command == "adopt":
+                print_json(keeper.signin_adopt(args.source))
+            elif args.signin_command == "register":
+                print_json(keeper.signin_register(args.brainstem_dir))
+            elif args.signin_command == "unregister":
+                print_json(keeper.signin_unregister(args.brainstem_dir))
+            elif args.signin_command == "sync":
+                print_json(keeper.signin_sync())
         elif args.command == "install-service":
             keeper.install_service()
         elif args.command == "uninstall-service":
