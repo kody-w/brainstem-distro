@@ -6,6 +6,10 @@ A **distro** is the Brainstem kernel, unchanged and pinned to one commit, plus w
 
 Click **Use this template** to start one.
 
+> **Naming, for the people who use it:** "distro" is a builder's word. To the people who install yours, it is just
+> **Brainstem**, described by what it does ("Brainstem with free models", "Brainstem for your team"). Never put
+> "distro" in front of your users.
+
 ## What you get
 
 | Piece | What it does |
