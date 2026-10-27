@@ -22,6 +22,12 @@ Click **Use this template** to start one.
 | `tools/check.py` | Proves you stand on the kernel unchanged. |
 | `tests/` | The plugin end to end, plus a real app-window run in a browser. |
 
+## Use it first, report what you hit
+
+Run your distro yourself before anyone else does, and keep [`DOGFOOD.md`](DOGFOOD.md): one line per rough edge.
+Fix what only you need in your distro; build what several distros need as an agent file or a sidecar; and propose a
+kernel change only when every user needs it and it can't be done from outside. Never patch your pinned kernel.
+
 ## Keep Brainstem running
 
 The optional [`keeper/`](keeper/) script safely upgrades the unchanged
